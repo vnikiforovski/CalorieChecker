@@ -3,8 +3,12 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 
+from meals.views import health_check_view
+
 urlpatterns = [
     path('admin/', admin.site.urls),
+    # Unauthenticated endpoint used by Docker healthchecks and load balancers
+    path('api/health/', health_check_view),
     path('api/auth/', include('users.urls')),
     path('api/', include('meals.urls')),
 ]

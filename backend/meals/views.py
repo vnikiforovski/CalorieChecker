@@ -4,12 +4,18 @@ from datetime import date, timedelta
 from django.shortcuts import get_object_or_404
 from rest_framework import status, generics
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 
 from ai_service.analyzer import analyze_meal
 from .models import Meal, FoodItem, DailyLog
 from .serializers import MealSerializer, DailyLogSerializer
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def health_check_view(request):
+    return Response({'status': 'healthy', 'service': 'calorie-checker-backend'})
 
 
 def _sync_daily_log(user, log_date):

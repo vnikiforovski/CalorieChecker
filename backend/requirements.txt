@@ -8,3 +8,6 @@ pillow
 python-dotenv
 django-filter
 gunicorn
+pytest
+pytest-django
+flake8

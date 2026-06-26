@@ -1,0 +1,13 @@
+# Dependencies — reinstalled inside the builder stage
+node_modules/
+
+# Local secrets
+.env
+
+# Version control and docs
+.git/
+.gitignore
+README.md
+
+# Previous build output — the builder stage creates a fresh one
+dist/

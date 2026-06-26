@@ -1,0 +1,34 @@
+name: Feature Branch Lint
+
+on:
+  push:
+    branches:
+      - 'feature/*'
+
+jobs:
+
+  lint:
+    name: Lint (Python)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Run flake8 on Python backend
+        run: |
+          flake8 backend/ \
+            --max-line-length=120 \
+            --exclude=backend/*/migrations,backend/.venv,backend/venv \
+            --count \
+            --statistics

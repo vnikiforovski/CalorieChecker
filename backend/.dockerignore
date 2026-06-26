@@ -1,0 +1,21 @@
+# Python cache — rebuilt inside the container
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Local secrets — injected via docker-compose env_file
+.env
+.venv/
+
+# Version control and docs — not needed in the image
+.git/
+.gitignore
+README.md
+
+# User-uploaded files — mounted as a named volume at runtime
+media/
+
+# Test and local DB artifacts
+.pytest_cache/
+*.sqlite3
