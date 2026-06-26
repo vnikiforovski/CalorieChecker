@@ -7,3 +7,4 @@ psycopg2-binary
 pillow
 python-dotenv
 django-filter
+gunicorn
