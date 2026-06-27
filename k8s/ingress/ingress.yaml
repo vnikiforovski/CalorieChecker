@@ -220,7 +220,38 @@ spec:
                   number: 8000
 
           # ===================================================================
-          # RULE 3: Everything else → React frontend
+          # RULE 3: Django static files → nginx-static sidecar on backend pod
+          # ===================================================================
+          - path: /static/
+            # Django's collectstatic writes files to STATIC_ROOT (/app/staticfiles).
+            # The nginx-static sidecar mounts that directory and serves it on port 8080.
+            # All Django static assets (admin CSS/JS, DRF browseable API, app statics)
+            # live under /static/ — this rule forwards those requests directly to nginx,
+            # bypassing Gunicorn entirely. nginx is ~10× faster than Gunicorn at serving
+            # pre-built files.
+            #
+            # How requests are resolved:
+            #   /static/admin/css/base.css
+            #     → backend Service port 8080
+            #     → nginx-static container (port 8080)
+            #     → file /usr/share/nginx/html/static/admin/css/base.css
+            #        (from the "static-files" emptyDir volume)
+            #
+            # URL is passed unchanged to nginx — nginx's "root" directive handles mapping.
+
+            pathType: Prefix
+
+            backend:
+              service:
+                name: backend
+                # The SAME backend Service, but on port 8080 (the nginx-static sidecar).
+                # Service selector "app: backend" routes to backend pods, which contain
+                # both the gunicorn container (port 8000) and nginx-static (port 8080).
+                port:
+                  number: 8080
+
+          # ===================================================================
+          # RULE 4: Everything else → React frontend
           # ===================================================================
           - path: /
             # The catch-all: match any request not matched by the rules above.

@@ -91,3 +91,22 @@ spec:
       #
       # You can also use the port's name: targetPort: http
       # (referencing the name we set in the Deployment's containerPort)
+
+    - name: static
+      # Second port for the nginx-static sidecar container in the backend pod.
+      # The nginx-static sidecar serves Django's collected static files on 8080.
+      # The Ingress routes /static/ → this port → nginx-static → emptyDir volume.
+      #
+      # Why a sidecar instead of a separate Deployment?
+      #   - Static files are generated from the same backend image (collectstatic)
+      #   - Using an emptyDir shared between init container and sidecar is simpler
+      #     than a PVC or a separate collectstatic Job + PVC
+      #   - Keeps static file serving tightly coupled to the backend pod lifecycle
+
+      protocol: TCP
+      port: 8080
+      # The port the SERVICE exposes. Ingress references: backend:8080.
+
+      targetPort: 8080
+      # Forwards to containerPort 8080 on the nginx-static sidecar container.
+      # Must match containerPort defined in the Deployment's nginx-static container.

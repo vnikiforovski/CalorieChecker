@@ -247,6 +247,64 @@ jobs:
           prerelease: false
 
 
+  deploy-to-kubernetes:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    # Runs on every push to master/release/* and every version tag.
+    # Triggers after Docker images are confirmed pushed to DockerHub.
+    #
+    # Required GitHub Secrets (Settings → Secrets and variables → Actions):
+    #   DIGITALOCEAN_ACCESS_TOKEN — DigitalOcean personal access token
+    #                               (Scope: read + write on Kubernetes)
+    #   K8S_CLUSTER_NAME          — name of your DigitalOcean K8s cluster
+    #                               (visible in the DigitalOcean dashboard)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install and authenticate doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        # doctl is the DigitalOcean CLI. This action:
+        #   1. Installs the latest doctl binary on the runner
+        #   2. Runs "doctl auth init --access-token <token>" automatically
+        # After this step, all doctl commands are authenticated.
+
+      - name: Save kubeconfig for cluster
+        run: doctl kubernetes cluster kubeconfig save ${{ secrets.K8S_CLUSTER_NAME }}
+        # Downloads the cluster's kubeconfig and merges it into ~/.kube/config.
+        # After this step, kubectl commands automatically target the DigitalOcean
+        # Kubernetes cluster. K8S_CLUSTER_NAME is the cluster name in the DO dashboard
+        # (e.g. "caloriechecker-cluster").
+
+      - name: Roll out new backend image
+        run: kubectl rollout restart deployment/backend -n caloriechecker-prod
+        # Triggers a rolling update on the backend Deployment.
+        # Kubernetes terminates old pods one at a time and starts new pods that
+        # pull the freshly-pushed "latest" image from DockerHub.
+        # The Deployment's maxUnavailable: 0 ensures zero downtime during the rollout.
+
+      - name: Roll out new frontend image
+        run: kubectl rollout restart deployment/frontend -n caloriechecker-prod
+        # Same rolling restart for the frontend Deployment.
+        # nginx in new pods serves the Vite-built React app from the updated image.
+
+      - name: Wait for backend rollout to complete
+        run: kubectl rollout status deployment/backend -n caloriechecker-prod --timeout=300s
+        # Blocks until all backend pods are running the new image and passing their
+        # readinessProbe (/api/health/ returns 200). Times out after 5 minutes.
+        # If the new pods crash-loop, this step fails → GitHub Actions job goes red
+        # → team is notified to investigate before the issue reaches users.
+
+      - name: Wait for frontend rollout to complete
+        run: kubectl rollout status deployment/frontend -n caloriechecker-prod --timeout=300s
+        # Same wait for frontend. Ensures the job only succeeds once both deployments
+        # are fully healthy with the new images.
+
+
   deploy:
     name: Deploy
     runs-on: ubuntu-latest

@@ -11,7 +11,10 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-placeholder-change-
 
 DEBUG = os.getenv('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,backend').split(',')
+# In Kubernetes, DJANGO_ALLOWED_HOSTS is set to "*" via the ConfigMap, so the
+# default below only applies in local development (no env var set).
+# 138.68.126.78 is the DigitalOcean load balancer IP for the production cluster.
+ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,backend,138.68.126.78').split(',')
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -119,6 +122,7 @@ CORS_ALLOWED_ORIGINS = [
     'http://127.0.0.1:5173',
     'http://localhost',
     'http://frontend',
+    'http://138.68.126.78',  # DigitalOcean production load balancer IP
 ]
 CORS_ALLOW_CREDENTIALS = True
 

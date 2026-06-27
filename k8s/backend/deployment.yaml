@@ -235,6 +235,56 @@ spec:
             # The pod-level runAsNonRoot=true would reject busybox, so we relax it here.
             # Only the init container is affected — main containers still run as uid=1000.
 
+        # -----------------------------------------------------------------------
+        # INIT CONTAINER 2: collect-static
+        # -----------------------------------------------------------------------
+        # Runs Django's collectstatic before any main containers start.
+        # collectstatic gathers all static files from every installed app into
+        # STATIC_ROOT (/app/staticfiles), which is mapped to the "static-files"
+        # emptyDir volume. The nginx-static sidecar then serves those files.
+        #
+        # Why an init container?
+        #   Init containers run to COMPLETION before any main container starts.
+        #   This guarantees static files exist before nginx-static probes /static/.
+        #   No race condition: gunicorn and nginx-static start only after this exits 0.
+        #
+        # Volume handoff (the "init container → sidecar" pattern):
+        #   collect-static writes to:  /app/staticfiles          (emptyDir "static-files")
+        #   nginx-static reads from:   /usr/share/nginx/html/static  (same emptyDir)
+        - name: collect-static
+          image: vnikiforovski0604/caloriechecker-backend:latest
+          imagePullPolicy: Always
+          # Same image as the main backend — has manage.py and all Django apps.
+
+          command: ["python", "manage.py", "collectstatic", "--noinput"]
+          # --noinput: suppress interactive prompts — required for non-interactive K8s.
+          # Copies files from every app's /static/ directory and STATICFILES_DIRS
+          # into STATIC_ROOT (/app/staticfiles = the "static-files" emptyDir volume).
+
+          envFrom:
+            - secretRef:
+                name: caloriechecker-secrets
+            # DJANGO_SECRET_KEY: Django requires this to initialize, even for collectstatic.
+            # POSTGRES_*: required for the app registry to load (DB is not actually queried).
+            - configMapRef:
+                name: caloriechecker-config
+            # POSTGRES_DB, POSTGRES_HOST, POSTGRES_PORT, DEBUG=False.
+
+          volumeMounts:
+            - name: static-files
+              mountPath: /app/staticfiles
+              # Django STATIC_ROOT = BASE_DIR / 'staticfiles' = /app/staticfiles.
+              # Mounting the emptyDir here makes collectstatic write into the shared
+              # volume. nginx-static mounts the same volume to serve the files.
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            # uid=1000: same non-root user as the main backend container.
+            # collectstatic only reads source files and writes to the emptyDir.
+
       # =========================================================================
       # MAIN CONTAINERS
       # =========================================================================
@@ -429,54 +479,109 @@ spec:
             #   - Deployment rollouts (new pod not ready yet)
 
         # -----------------------------------------------------------------------
-        # SIDECAR CONTAINER: Log Shipper (simulated)
+        # SIDECAR CONTAINER: nginx-static
         # -----------------------------------------------------------------------
-        # In Kubernetes, the "sidecar pattern" means running a helper container
-        # alongside your main container in the same pod. Both containers share:
-        #   - The same network namespace (can talk via localhost)
-        #   - The same mounted volumes (can share files)
+        # Serves Django's collected static files on port 8080.
+        # Files are written by the collect-static init container (above) into
+        # the "static-files" emptyDir volume. This sidecar mounts that volume
+        # read-only and exposes its contents via nginx.
         #
-        # A real log shipper (like Fluent Bit or Filebeat) would:
-        #   1. Read Django log files from a shared volume
-        #   2. Parse and enrich log entries (add pod name, namespace, etc.)
-        #   3. Ship logs to a centralized system (Elasticsearch, Loki, CloudWatch)
+        # Traffic path:
+        #   Browser → Ingress (/static/* rule) → backend Service :8080
+        #           → this nginx-static container
         #
-        # For now, we simulate it with busybox running "tail -f /dev/null"
-        # (a command that does nothing but keeps the container running).
-        # In production, replace this with Fluent Bit.
+        # Non-root nginx operation:
+        #   The pod-level securityContext forces uid=1000. nginx:alpine is
+        #   designed to start as root and drop privileges, but can be made to
+        #   run entirely as non-root with the right nginx.conf (see ConfigMap
+        #   nginx-static-config in k8s/configmaps/nginx-static-configmap.yaml).
+        #   Key trick: pid /tmp/nginx.pid + all temp paths in /tmp.
         # -----------------------------------------------------------------------
-        - name: log-shipper
-          image: busybox:1.35
-          # TODO: Replace with fluent/fluent-bit:latest for production log shipping.
-          # Fluent Bit is a lightweight log processor that collects, filters,
-          # and ships logs to destinations like Elasticsearch or Loki.
-          # See: https://docs.fluentbit.io/manual/installation/kubernetes
-
+        - name: nginx-static
+          image: nginx:alpine
+          # nginx:alpine ~40MB — very fast at serving static files.
           imagePullPolicy: IfNotPresent
+          # IfNotPresent: avoids redundant pulls if the image is already cached
+          # on the node. nginx:alpine doesn't change often; "latest" is stable.
 
-          command:
-            - sh
-            - -c
-            - |
-              echo "Log shipper sidecar started (simulated)"
-              while true; do sleep 3600; done
-          # "while true; do sleep 3600; done" is the reliable way to keep a
-          # container alive indefinitely. "tail -f /dev/null" can exit on some
-          # BusyBox builds when the runtime sends signals to the process group.
+          ports:
+            - name: static
+              containerPort: 8080
+              # Non-privileged port (>1024) — no root needed to bind.
+              # The backend Service exposes this as port 8080 (name: static).
+              # The Ingress routes /static/ → backend:8080 → this container.
+
+          volumeMounts:
+            - name: nginx-static-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+              # Replace the default nginx.conf with our ConfigMap's version.
+              # subPath: mount only the "nginx.conf" key as a single file,
+              # not the entire ConfigMap as a directory. Necessary when replacing
+              # a specific file inside a directory that already has other files.
+
+            - name: static-files
+              mountPath: /usr/share/nginx/html/static
+              readOnly: true
+              # The same emptyDir that collect-static wrote into.
+              # read-only: nginx only reads static files, never writes them.
+              # nginx.conf: root /usr/share/nginx/html; location /static/ → serves
+              # files from /usr/share/nginx/html/static/<filename>.
 
           resources:
             requests:
-              cpu: 50m       # Very light — just a sleeping process
+              cpu: 50m
               memory: 64Mi
             limits:
               cpu: 100m
               memory: 128Mi
-          # Sidecar containers should have small resource allocations.
-          # They share the node's resources with the main container.
-          # A greedy sidecar could starve the main container of resources.
+
+          readinessProbe:
+            httpGet:
+              path: /static/
+              port: 8080
+            initialDelaySeconds: 5
+            # Wait 5s before the first probe — nginx needs a moment to parse config.
+            periodSeconds: 10
+            failureThreshold: 3
+            # /static/ returns 200 with a directory listing (autoindex on in the
+            # nginx.conf ConfigMap). Confirms nginx is up and files are mounted.
 
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: false
             runAsNonRoot: true
             runAsUser: 1000
+            # uid=1000 (inherited from pod-level, confirmed explicitly here).
+            # readOnlyRootFilesystem: false — nginx creates /tmp/nginx_* temp dirs.
+            # The ConfigMap's nginx.conf redirects all writes to /tmp.
+
+      # =========================================================================
+      # VOLUMES
+      # =========================================================================
+      # emptyDir: ephemeral storage, exists only as long as the pod lives.
+      #   Created empty at pod start, deleted when the pod is removed.
+      #   Shared between ALL containers in the pod (init containers + sidecars).
+      #   Ideal for the init → sidecar handoff: init writes, sidecar reads.
+      #
+      # configMap: exposes ConfigMap keys as files on the container filesystem.
+      #   Updates to the ConfigMap propagate to mounted files within ~60s.
+      volumes:
+        - name: static-files
+          emptyDir: {}
+          # Pod-scoped lifecycle: content is regenerated on every pod start via
+          # the collect-static init container. No persistence needed — static
+          # files are baked into the Docker image and re-collected each time.
+          #
+          # Used by:
+          #   collect-static init container → writes to /app/staticfiles
+          #   nginx-static sidecar         → reads from /usr/share/nginx/html/static
+
+        - name: nginx-static-config
+          configMap:
+            name: nginx-static-config
+          # Mounts the nginx-static-config ConfigMap as a volume.
+          # nginx-static uses subPath to mount only the "nginx.conf" key as a
+          # single file at /etc/nginx/nginx.conf, replacing the default config.
+          # Defined in k8s/configmaps/nginx-static-configmap.yaml.

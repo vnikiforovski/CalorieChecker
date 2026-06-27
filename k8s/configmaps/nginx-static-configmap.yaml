@@ -1,0 +1,90 @@
+# =============================================================================
+# CONFIGMAP: nginx-static-config
+# =============================================================================
+# Contains the nginx.conf used by the nginx-static sidecar in the backend
+# Deployment. The sidecar serves Django's collected static files on port 8080.
+#
+# Flow:
+#   1. collect-static init container: "manage.py collectstatic --noinput"
+#      Writes all static files to /app/staticfiles (the "static-files" emptyDir)
+#   2. nginx-static sidecar: mounts that same emptyDir at
+#      /usr/share/nginx/html/static and serves via this nginx.conf
+#   3. The Ingress routes /static/ → backend Service port 8080 → this sidecar
+#
+# Non-root nginx design (pod runs all containers as uid=1000):
+#   Standard nginx:alpine expects root because it writes to root-owned paths:
+#     /var/run/nginx.pid   → replaced by: pid /tmp/nginx.pid
+#     /var/log/nginx/      → replaced by: access_log /dev/stdout; error_log /dev/stderr
+#     /var/cache/nginx/    → replaced by: *_temp_path /tmp/nginx_*/
+#   Port 8080 needs no root (only ports < 1024 require root to bind).
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+
+metadata:
+  name: nginx-static-config
+  namespace: caloriechecker-prod
+
+  labels:
+    app: backend
+    component: nginx-static
+
+data:
+  nginx.conf: |
+    # PID file in /tmp — writable by all users (mode 1777).
+    # Default /var/run/nginx.pid is owned by root, not writable as uid=1000.
+    pid /tmp/nginx.pid;
+
+    events {
+        worker_connections 256;
+        # Low value: this sidecar only serves static files from within the pod,
+        # not a general-purpose internet-facing nginx.
+    }
+
+    http {
+        include /etc/nginx/mime.types;
+        # /etc/nginx/mime.types is read-only in the image — uid=1000 can read it.
+        # Provides correct Content-Type for .css, .js, .png, .woff2, etc.
+
+        default_type application/octet-stream;
+
+        # Log to stdout/stderr so output appears in "kubectl logs".
+        # /var/log/nginx/ is owned by root — not writable as uid=1000.
+        access_log /dev/stdout;
+        error_log  /dev/stderr;
+
+        # All nginx temp directories moved to /tmp.
+        # /var/cache/nginx/ is owned by root; /tmp has mode 1777 (world-writable).
+        client_body_temp_path /tmp/nginx_client_body;
+        proxy_temp_path       /tmp/nginx_proxy;
+        fastcgi_temp_path     /tmp/nginx_fastcgi;
+        uwsgi_temp_path       /tmp/nginx_uwsgi;
+        scgi_temp_path        /tmp/nginx_scgi;
+
+        server {
+            listen 8080;
+            # Non-privileged port — root not required to bind (only ports < 1024 need root).
+            # The backend Service's "static" port (8080) routes here.
+            # The Ingress forwards /static/ → backend:8080 → this server block.
+
+            root /usr/share/nginx/html;
+            # Django static files are mounted at /usr/share/nginx/html/static by
+            # the "static-files" emptyDir volume. With this root, nginx resolves:
+            #   request: /static/admin/css/base.css
+            #   file:    /usr/share/nginx/html/static/admin/css/base.css
+
+            location /static/ {
+                # autoindex on: return 200 with a directory listing for /static/.
+                # Required for the readinessProbe (GET /static/ must return 2xx).
+                # Without this, nginx returns 403 Forbidden for directory requests.
+                autoindex on;
+
+                # Aggressive caching: Django's collectstatic appends content hashes
+                # to filenames (e.g., base.3f2a1c.css). Browsers can cache forever
+                # because the URL changes whenever the file content changes.
+                expires 1y;
+                add_header Cache-Control "public, immutable";
+            }
+        }
+    }
