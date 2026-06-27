@@ -84,10 +84,11 @@ class AnalyzeMealView(generics.GenericAPIView):
             total_fat=ai_result.get('total_fat', 0),
         )
 
-        if image_file:
-            image_file.seek(0)
-            meal.image = image_file
-            meal.save(update_fields=['image'])
+        # Image persistence is intentionally skipped: the container filesystem is
+        # ephemeral (no PVC) and media files are not served in production
+        # (static() URL only activates when DEBUG=True). The image was already
+        # read into memory and sent to Claude above. Add DO Spaces / S3 storage
+        # backend (django-storages) before re-enabling image saves.
 
         FoodItem.objects.bulk_create([
             FoodItem(

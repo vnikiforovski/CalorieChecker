@@ -58,3 +58,9 @@ class ProfileView(generics.RetrieveUpdateAPIView):
 
     def get_object(self):
         return self.request.user
+
+    def update(self, request, *args, **kwargs):
+        # Force partial=True so the frontend can PUT only the fields it cares
+        # about (e.g. just profile data) without having to resend username/email.
+        kwargs['partial'] = True
+        return super().update(request, *args, **kwargs)
