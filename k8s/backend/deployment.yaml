@@ -1,0 +1,482 @@
+# =============================================================================
+# KUBERNETES DEPLOYMENT: Django Backend
+# =============================================================================
+# What is a Deployment?
+#   A Deployment is the standard way to run stateless applications in Kubernetes.
+#   It manages a set of identical pods (replicas) and ensures that the desired
+#   number of replicas are always running.
+#
+# What does "stateless" mean?
+#   Each pod can handle any request — there's no local state stored in the pod.
+#   All state lives in the PostgreSQL database. This means:
+#     - Any pod can be killed and replaced without data loss
+#     - You can scale to more pods anytime
+#     - Load balancing works perfectly across all pods
+#
+# Key Deployment features we use here:
+#   - Rolling updates: replace pods one at a time, zero downtime
+#   - Health checks: automatically restart unhealthy pods
+#   - Resource limits: prevent one app from starving the whole node
+#   - Pod anti-affinity: spread pods across nodes for high availability
+# =============================================================================
+
+apiVersion: apps/v1   # "apps/v1" is the API group for Deployments, StatefulSets, DaemonSets
+kind: Deployment      # This resource type manages stateless pod replicas
+
+metadata:
+  name: backend                  # The name of this Deployment
+  namespace: caloriechecker-prod # Must exist (created in namespaces/prod-namespace.yaml)
+
+  labels:
+    # Labels on the Deployment itself (used to find/organize the Deployment resource)
+    app: backend
+    tier: backend
+    environment: production
+
+  annotations:
+    # Annotations provide human-readable or tool-readable metadata.
+    # They can't be used in selectors, but tools like Helm, ArgoCD, or CI/CD
+    # pipelines often read annotations for configuration.
+    description: "Django REST API backend for CalorieChecker application"
+    version: "1.0.0"
+    # You can update "version" when deploying new releases to track what's running.
+
+spec:
+  # =============================================================================
+  # REPLICAS
+  # =============================================================================
+  replicas: 2
+  # Run 2 identical copies (pods) of the backend simultaneously.
+  #
+  # Why 2?
+  #   - High availability: if one pod crashes or a node goes down, the other
+  #     pod continues serving traffic with zero downtime.
+  #   - Load distribution: traffic is split between both pods.
+  #   - Rolling updates: with 2 pods, we can update one while the other serves traffic.
+  #
+  # Why not 1?
+  #   Single point of failure. If that one pod crashes during peak hours, your
+  #   app is completely down until Kubernetes starts a replacement (~30 seconds).
+  #
+  # Why not 3+ from the start?
+  #   Cost. Our DigitalOcean cluster has 2 nodes, so 2 replicas already gives us
+  #   one pod per node. More replicas can be added automatically by the HPA.
+
+  # =============================================================================
+  # SELECTOR
+  # =============================================================================
+  selector:
+    matchLabels:
+      app: backend
+  # The Deployment uses this selector to "own" pods.
+  # It will manage ALL pods that have the label "app: backend".
+  # If you create a pod manually with "app: backend", this Deployment will
+  # adopt it (and potentially delete it to match the replica count!).
+  # IMPORTANT: selector is immutable — you cannot change it after creation.
+
+  # =============================================================================
+  # UPDATE STRATEGY
+  # =============================================================================
+  strategy:
+    type: RollingUpdate
+    # RollingUpdate gradually replaces old pods with new ones.
+    # This ensures the app stays available during deployments.
+    #
+    # Alternative: Recreate — kills ALL old pods first, then creates new ones.
+    # Use Recreate only when you can't run old and new code simultaneously
+    # (e.g., breaking database schema changes). We avoid it here.
+
+    rollingUpdate:
+      maxSurge: 1
+      # During an update, allow UP TO 1 extra pod beyond the desired replica count.
+      # With replicas=2, this means we can temporarily have 3 pods (2 old + 1 new).
+      # The new pod must pass its readiness probe before an old pod is removed.
+      # This ensures continuous availability.
+
+      maxUnavailable: 0
+      # ZERO old pods can be taken offline before a new pod is ready.
+      # Combined with maxSurge=1, this achieves TRUE zero-downtime deployments:
+      #   Step 1: Start 1 new pod (now we have 2 old + 1 new = 3 total)
+      #   Step 2: New pod passes readiness check
+      #   Step 3: Kill 1 old pod (now 1 old + 1 new = 2 total)
+      #   Step 4: Start another new pod (1 old + 2 new = 3 total)
+      #   Step 5: New pod passes readiness check
+      #   Step 6: Kill last old pod (2 new = 2 total) ✓
+
+  # =============================================================================
+  # POD TEMPLATE
+  # Everything under "template" defines what each pod looks like.
+  # The Deployment creates pods that match this template.
+  # =============================================================================
+  template:
+    metadata:
+      labels:
+        # These labels MUST include the selector labels (app: backend).
+        # Kubernetes uses these labels to connect pods to Services and Deployments.
+        app: backend
+        tier: backend
+        environment: production
+
+    spec:
+      # =========================================================================
+      # terminationGracePeriodSeconds
+      # =========================================================================
+      terminationGracePeriodSeconds: 30
+      # When Kubernetes wants to stop a pod (during update, scale-down, etc.),
+      # it follows this sequence:
+      #   1. Send SIGTERM signal to the container process
+      #   2. Wait up to 30 seconds for the process to shut down gracefully
+      #   3. If still running after 30s, send SIGKILL (force kill)
+      #
+      # 30 seconds gives Django time to:
+      #   - Finish processing in-flight requests
+      #   - Close database connections cleanly
+      #   - Flush any pending writes
+      #
+      # The preStop hook (defined below) adds 5 more seconds BEFORE SIGTERM,
+      # giving the load balancer time to stop routing new requests to this pod.
+
+      # =========================================================================
+      # POD-LEVEL SECURITY CONTEXT
+      # Applies to ALL containers in this pod (main + sidecar + init containers)
+      # =========================================================================
+      securityContext:
+        runAsNonRoot: true
+        # Kubernetes will REJECT the pod if any container tries to run as root (uid=0).
+        # This is a defense-in-depth measure — even if someone compromises the
+        # container, they won't have root privileges on the host.
+
+        runAsUser: 1000
+        # Run all containers as Linux user ID 1000.
+        # This must match the USER directive in our Dockerfile.
+        # User 1000 is "appuser" — a non-privileged user with no special permissions.
+
+      # =========================================================================
+      # POD ANTI-AFFINITY
+      # Controls WHERE in the cluster pods are scheduled.
+      # =========================================================================
+      affinity:
+        podAntiAffinity:
+          # "Anti-affinity" means "try NOT to schedule near pods matching this selector"
+          # We use this to spread backend pods across different physical nodes.
+          #
+          # Why? High availability!
+          # If both pods were on the same node, and that node goes down (hardware
+          # failure, maintenance, etc.), BOTH pods die simultaneously → total outage.
+          # With anti-affinity, pods are spread across nodes → one node down = one
+          # pod dies → the other pod keeps serving traffic.
+
+          preferredDuringSchedulingIgnoredDuringExecution:
+          # "preferred" = soft rule (try to, but don't require)
+          # vs "required" = hard rule (ONLY schedule if constraint is satisfied)
+          #
+          # We use "preferred" because:
+          # - We only have 2 nodes; with "required" and 3+ replicas, extra pods
+          #   would be stuck in Pending (can't schedule anywhere)
+          # - "preferred" degrades gracefully — if no option satisfies the rule,
+          #   Kubernetes still schedules the pod somewhere
+          #
+          # "IgnoredDuringExecution" = if a node's labels change AFTER scheduling,
+          # running pods are NOT evicted. They only care about labels at schedule time.
+
+            - weight: 100
+              # Weight from 1-100. Higher = more preferred.
+              # 100 means "strongly prefer" spreading to different nodes.
+              # If you have multiple affinity rules with different weights,
+              # Kubernetes picks the node with the highest total score.
+
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: backend
+                  # Find other pods with "app: backend" label (our own pods)
+                  # and try NOT to schedule near them.
+
+                topologyKey: kubernetes.io/hostname
+                # "topology" defines what "near" means.
+                # kubernetes.io/hostname = each node is its own topology zone.
+                # So "don't schedule near" = "don't schedule on the same node".
+                #
+                # Other topology keys:
+                #   topology.kubernetes.io/zone = prefer different availability zones
+                #   topology.kubernetes.io/region = prefer different regions (rare)
+
+      # =========================================================================
+      # INIT CONTAINERS (run before main containers, must succeed first)
+      # =========================================================================
+      initContainers:
+        - name: wait-for-postgres
+          # Same pattern as in the migrate Job: wait until PostgreSQL is ready.
+          # Why here too? When a node restarts or a pod is rescheduled, PostgreSQL
+          # might not be ready yet. Django will crash on startup if it can't
+          # connect to the database during application initialization.
+
+          image: busybox:1.35
+          imagePullPolicy: IfNotPresent
+
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for PostgreSQL to be ready before starting Django..."
+              until nc -z postgres 5432; do
+                echo "PostgreSQL not ready. Retrying in 5 seconds..."
+                sleep 5
+              done
+              echo "PostgreSQL is up! Django backend will now start."
+          # Identical wait loop: test TCP connection to postgres:5432 every 5 seconds.
+          # "postgres" resolves to the ClusterIP of the postgres Service
+          # (defined in postgres/service.yaml).
+
+          securityContext:
+            runAsNonRoot: false
+            # busybox:1.35's nc command needs to run as root (uid=0).
+            # This overrides the pod-level securityContext for this specific container.
+            # The pod-level runAsNonRoot=true would reject busybox, so we relax it here.
+            # Only the init container is affected — main containers still run as uid=1000.
+
+      # =========================================================================
+      # MAIN CONTAINERS
+      # =========================================================================
+      containers:
+
+        # -----------------------------------------------------------------------
+        # PRIMARY CONTAINER: Django Backend
+        # -----------------------------------------------------------------------
+        - name: backend
+          image: vnikiforovski0604/caloriechecker-backend:latest
+          imagePullPolicy: Always
+          # Always pull from DockerHub — ensures "latest" tag is truly the newest image.
+
+          ports:
+            - name: http
+              containerPort: 8000
+              # The port our Django/Gunicorn server listens on inside the container.
+              # "name: http" lets Services reference it by name instead of number.
+              # Note: containerPort is documentation only — it doesn't actually
+              # open or restrict ports. All container ports are accessible by default.
+
+          # =========================================================================
+          # ENVIRONMENT VARIABLES
+          # Django reads these at startup to configure database, debug mode, etc.
+          # =========================================================================
+          envFrom:
+            - secretRef:
+                name: caloriechecker-secrets
+              # Injects from the Secret (sensitive values):
+              #   DJANGO_SECRET_KEY  — used to sign cookies, CSRF tokens, sessions
+              #   POSTGRES_PASSWORD  — password for the 'appuser' PostgreSQL account
+              #   ANTHROPIC_API_KEY  — key for calling Claude AI API
+              #   POSTGRES_USER      — username for PostgreSQL connection
+
+            - configMapRef:
+                name: caloriechecker-config
+              # Injects from the ConfigMap (non-sensitive values):
+              #   POSTGRES_DB    — name of the database (e.g., "caloriechecker")
+              #   POSTGRES_HOST  — hostname of PostgreSQL service (e.g., "postgres")
+              #   POSTGRES_PORT  — PostgreSQL port (e.g., "5432")
+              #   DEBUG          — Django debug mode ("False" in production)
+
+          # =========================================================================
+          # RESOURCE REQUESTS AND LIMITS
+          # =========================================================================
+          resources:
+            requests:
+              cpu: 250m
+              # "250m" = 250 millicores = 0.25 CPU cores
+              # Kubernetes GUARANTEES this much CPU to the container.
+              # The scheduler uses requests to decide which node to place the pod on.
+              # A node with 2 CPUs can fit at most 8 pods requesting 250m each.
+
+              memory: 256Mi
+              # "256Mi" = 256 mebibytes of RAM (1 MiB = 1,048,576 bytes)
+              # Kubernetes guarantees this much memory to the container.
+              # Django + Gunicorn with a few workers typically uses 100-200MB.
+
+            limits:
+              cpu: 500m
+              # The MAXIMUM CPU this container can use (0.5 cores).
+              # If the container tries to use more, Kubernetes throttles it
+              # (slows it down) but does NOT kill it.
+              # CPU is "compressible" — excess usage is throttled, not OOM-killed.
+
+              memory: 512Mi
+              # The MAXIMUM memory this container can use.
+              # If the container exceeds this, Kubernetes KILLS it with OOM (Out Of Memory).
+              # The pod then restarts (due to restartPolicy: Always in Deployments).
+              # Memory is "incompressible" — there's no throttling, only killing.
+              #
+              # Why limit = 2x request?
+              # This is a common pattern. Requests ensure baseline allocation;
+              # limits allow burst usage during traffic spikes.
+
+          # =========================================================================
+          # LIFECYCLE HOOKS
+          # =========================================================================
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+              # preStop runs BEFORE Kubernetes sends SIGTERM to the container.
+              # Timeline of a graceful shutdown:
+              #   T+0s:  Kubernetes decides to stop this pod
+              #   T+0s:  Kubernetes removes pod from Service endpoints (stops new traffic)
+              #   T+0s:  preStop hook starts running: "sleep 5"
+              #   T+5s:  preStop completes, Kubernetes sends SIGTERM
+              #   T+5s:  Django/Gunicorn starts graceful shutdown
+              #   T+35s: terminationGracePeriodSeconds reached → SIGKILL if still running
+              #
+              # The 5-second sleep is critical:
+              # There's a race condition — the load balancer (kube-proxy) might still
+              # route traffic to this pod for a few seconds after it's removed from
+              # endpoints. The sleep ensures no requests arrive during shutdown.
+
+          # =========================================================================
+          # CONTAINER-LEVEL SECURITY CONTEXT
+          # Overrides or extends the pod-level securityContext for this container.
+          # =========================================================================
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Prevents the process from gaining more privileges than it started with.
+            # For example, blocks `sudo` or `setuid` binaries from escalating to root.
+            # This is defense-in-depth — even if Django code is compromised, the
+            # attacker can't escalate to root inside the container.
+
+            readOnlyRootFilesystem: false
+            # We set this to false because Django needs to write to the filesystem:
+            #   - Writing .pyc (compiled Python) files
+            #   - Writing uploaded media files (if MEDIA_ROOT is on disk)
+            #   - Writing log files
+            # In a more hardened setup, you'd mount specific writable directories
+            # as volumes and set readOnlyRootFilesystem: true.
+
+          # =========================================================================
+          # HEALTH PROBES
+          # Kubernetes uses these to know if the container is healthy.
+          #
+          # Three probe types:
+          #   startupProbe   — Is the app done starting up?
+          #   livenessProbe  — Is the app still alive (not deadlocked)?
+          #   readinessProbe — Is the app ready to receive traffic?
+          #
+          # They run in order: startup first, then liveness+readiness in parallel.
+          # All three hit our /api/health/ endpoint which returns 200 OK if Django
+          # is running and connected to the database.
+          # =========================================================================
+
+          startupProbe:
+            httpGet:
+              path: /api/health/
+              port: 8000
+              # Kubernetes sends an HTTP GET to http://pod-ip:8000/api/health/
+              # If response status is 200-399 → probe succeeds
+              # If status is 400+ or connection refused → probe fails
+            failureThreshold: 30
+            # Allow up to 30 consecutive failures before marking the container
+            # as failed (and restarting it).
+            periodSeconds: 10
+            # Check every 10 seconds.
+            # Total startup time allowed: 30 × 10 = 300 seconds (5 minutes)
+            # Django + database connection should start in well under 5 minutes.
+            # We're generous here to handle slow node cold starts.
+            #
+            # IMPORTANT: While startupProbe is running, livenessProbe and
+            # readinessProbe are DISABLED. This prevents liveness from killing
+            # the pod before it's had a chance to start.
+
+          livenessProbe:
+            httpGet:
+              path: /api/health/
+              port: 8000
+            initialDelaySeconds: 0
+            # Start checking immediately after startupProbe succeeds.
+            # (startupProbe already ensured the app is up, so no delay needed)
+            periodSeconds: 20
+            # Check every 20 seconds.
+            # Less frequent than readinessProbe — liveness is for detecting
+            # deadlocks/crashes, which don't need to be caught immediately.
+            failureThreshold: 3
+            # If 3 consecutive checks fail (60 seconds of failure), Kubernetes
+            # KILLS and RESTARTS the container. This recovers from:
+            #   - Django process deadlocked
+            #   - Gunicorn workers all died
+            #   - Any unrecoverable error state
+            #
+            # Don't set failureThreshold too low! A brief spike could
+            # cause unnecessary restarts, creating a crash loop.
+
+          readinessProbe:
+            httpGet:
+              path: /api/health/
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            # Check every 10 seconds — more frequent than liveness.
+            # Fast detection matters here: if a pod becomes "not ready",
+            # Kubernetes stops sending it traffic within ~10-20 seconds.
+            successThreshold: 1
+            # After a failure, 1 successful check marks the pod as ready again.
+            # (For readiness, the default is 1, but being explicit is good practice)
+            failureThreshold: 3
+            # After 3 failures (30 seconds), the pod is marked "not ready".
+            # Kubernetes REMOVES it from the Service's endpoint list.
+            # Traffic stops going to it, but the pod is NOT restarted
+            # (that's liveness probe's job). Once healthy again, it rejoins.
+            #
+            # This is perfect for handling:
+            #   - Temporary database connection issues
+            #   - Overloaded pod (too slow to respond)
+            #   - Deployment rollouts (new pod not ready yet)
+
+        # -----------------------------------------------------------------------
+        # SIDECAR CONTAINER: Log Shipper (simulated)
+        # -----------------------------------------------------------------------
+        # In Kubernetes, the "sidecar pattern" means running a helper container
+        # alongside your main container in the same pod. Both containers share:
+        #   - The same network namespace (can talk via localhost)
+        #   - The same mounted volumes (can share files)
+        #
+        # A real log shipper (like Fluent Bit or Filebeat) would:
+        #   1. Read Django log files from a shared volume
+        #   2. Parse and enrich log entries (add pod name, namespace, etc.)
+        #   3. Ship logs to a centralized system (Elasticsearch, Loki, CloudWatch)
+        #
+        # For now, we simulate it with busybox running "tail -f /dev/null"
+        # (a command that does nothing but keeps the container running).
+        # In production, replace this with Fluent Bit.
+        # -----------------------------------------------------------------------
+        - name: log-shipper
+          image: busybox:1.35
+          # TODO: Replace with fluent/fluent-bit:latest for production log shipping.
+          # Fluent Bit is a lightweight log processor that collects, filters,
+          # and ships logs to destinations like Elasticsearch or Loki.
+          # See: https://docs.fluentbit.io/manual/installation/kubernetes
+
+          imagePullPolicy: IfNotPresent
+
+          command:
+            - sh
+            - -c
+            - |
+              echo "Log shipper sidecar started (simulated)"
+              while true; do sleep 3600; done
+          # "while true; do sleep 3600; done" is the reliable way to keep a
+          # container alive indefinitely. "tail -f /dev/null" can exit on some
+          # BusyBox builds when the runtime sends signals to the process group.
+
+          resources:
+            requests:
+              cpu: 50m       # Very light — just a sleeping process
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          # Sidecar containers should have small resource allocations.
+          # They share the node's resources with the main container.
+          # A greedy sidecar could starve the main container of resources.
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            runAsNonRoot: true
+            runAsUser: 1000

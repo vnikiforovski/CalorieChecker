@@ -1,0 +1,177 @@
+# =============================================================================
+# HORIZONTAL POD AUTOSCALER (HPA): Backend
+# =============================================================================
+# What is an HPA?
+#   A HorizontalPodAutoscaler automatically adjusts the number of pod replicas
+#   in a Deployment based on observed metrics (CPU, memory, custom metrics).
+#
+#   "Horizontal" scaling = adding/removing pod replicas (more copies)
+#   "Vertical" scaling   = changing CPU/memory limits on existing pods (bigger pods)
+#
+#   HPA is horizontal. VPA (VerticalPodAutoscaler) handles vertical scaling.
+#
+# How does HPA work?
+#   1. The HPA controller queries the Metrics Server every 15 seconds (default)
+#   2. It calculates: desiredReplicas = ceil(currentReplicas × (currentMetric / targetMetric))
+#   3. If desiredReplicas ≠ currentReplicas, it adjusts the Deployment
+#
+#   Example with CPU target 70%:
+#     - 2 pods running at 140% average CPU (way over target!)
+#     - desiredReplicas = ceil(2 × (140/70)) = ceil(4) = 4 pods
+#     - HPA scales up to 4 pods
+#
+# Prerequisites:
+#   The Metrics Server must be installed in the cluster.
+#   On DigitalOcean Kubernetes, Metrics Server is pre-installed.
+#   Verify: kubectl top pods -n caloriechecker-prod
+#
+# Note: HPA requires that pods have resource REQUESTS set.
+#   (We set them in the Deployment.) HPA calculates usage as a
+#   percentage of the requested amount, not the limit.
+# =============================================================================
+
+apiVersion: autoscaling/v2   # "v2" supports multiple metric types (CPU + Memory + custom)
+                              # "v1" only supported CPU — always use v2
+kind: HorizontalPodAutoscaler
+
+metadata:
+  name: backend-hpa
+  namespace: caloriechecker-prod
+
+  labels:
+    app: backend
+    tier: backend
+
+spec:
+  # =============================================================================
+  # SCALE TARGET
+  # Which Deployment should the HPA control?
+  # =============================================================================
+  scaleTargetRef:
+    apiVersion: apps/v1   # The API version of the target resource
+    kind: Deployment      # We're scaling a Deployment
+    name: backend         # Must exactly match the Deployment's metadata.name
+
+  # =============================================================================
+  # REPLICA BOUNDS
+  # =============================================================================
+  minReplicas: 2
+  # Never scale below 2 replicas, even when traffic is zero.
+  # Reasons:
+  #   1. High availability: 1 pod = single point of failure
+  #   2. Affinity: we want pods on different nodes; need ≥2 pods for that
+  #   3. Warm standby: a 2nd pod is already warm when traffic arrives
+
+  maxReplicas: 5
+  # Never scale above 5 replicas.
+  # Reasons:
+  #   1. Cost control: each pod uses ~256MB RAM and 0.25 CPU
+  #   2. Our DigitalOcean nodes have finite capacity
+  #   3. 5 pods handles significant traffic (5 × 0.5 CPU = 2.5 cores of Django)
+  # Adjust based on your traffic patterns and node capacity.
+
+  # =============================================================================
+  # METRICS: What triggers scaling?
+  # =============================================================================
+  metrics:
+    # -------------------------------------------------------------------------
+    # Metric 1: CPU Utilization
+    # -------------------------------------------------------------------------
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+          # Scale up when AVERAGE CPU across all backend pods exceeds 70%.
+          #
+          # "70% of what?" → 70% of the CPU REQUEST (250m per pod).
+          # So scale up when average usage > 175m millicores per pod.
+          #
+          # Why 70% and not 100%?
+          #   CPU scaling has a delay (metrics collection + stabilization window).
+          #   If you wait until 100%, pods are already overwhelmed.
+          #   70% leaves 30% headroom for the time it takes to start new pods.
+          #
+          # Typical Django API response time at 70% CPU is still fast.
+          # At 90%+, you'd see request queue buildup and slow responses.
+
+    # -------------------------------------------------------------------------
+    # Metric 2: Memory Utilization
+    # -------------------------------------------------------------------------
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+          # Scale up when AVERAGE memory across pods exceeds 80%.
+          # 80% of 256Mi request = ~204Mi used.
+          #
+          # Why higher threshold (80%) than CPU (70%)?
+          #   Memory leaks are gradual; we scale earlier for CPU since
+          #   CPU spikes are more sudden. Also, memory scaling is less critical
+          #   since the pod won't be killed until it hits the LIMIT (512Mi),
+          #   which is 2x the request. Still, 80% is a sensible early warning.
+          #
+          # Note: HPA on memory is less common than CPU because memory
+          # usage doesn't always drop when you add more pods (unlike CPU,
+          # which is shared). But for stateless apps like Django, it works well.
+
+  # =============================================================================
+  # SCALING BEHAVIOR
+  # Controls HOW FAST the HPA scales up and down.
+  # Without this, scaling can be too aggressive (flapping) or too slow.
+  # =============================================================================
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      # Wait 60 seconds after a scale-up before considering another scale-up.
+      # This prevents "flapping" — rapidly scaling up due to a brief spike,
+      # then those pods become unnecessary once the spike passes.
+      #
+      # Example: A traffic spike at T=0s causes scale-up from 2→3 pods.
+      # Even if metrics are still high at T=30s, HPA waits until T=60s
+      # before scaling to 4 pods. This gives the new pod time to start
+      # and reduce the per-pod load.
+
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+          # Add at most 2 pods per 60-second period.
+          # This prevents a sudden traffic spike from instantly scaling to maxReplicas.
+          # Gradual scale-up avoids overwhelming the database with new connections.
+          #
+          # Example timeline:
+          #   T=0:   2 pods, traffic spike → HPA wants 5 pods
+          #   T=0:   Scale to 4 (2+2 max) — can't go to 5 yet
+          #   T=60:  Still high traffic → scale to 5 (4+1, but max is 5)
+          #
+          # selectPolicy: Max (default) — when multiple policies exist,
+          # use the one that allows the largest change.
+
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      # Wait 300 seconds (5 minutes) after metrics drop before scaling down.
+      # This is much longer than scaleUp because:
+      #   1. Traffic often has "sawtooth" patterns — brief lulls then spikes
+      #   2. Starting a pod takes ~30 seconds; scaling down and then up wastes time
+      #   3. We prefer keeping warm pods over aggressive cost-cutting
+      #
+      # Real example: lunchtime traffic drops at 1pm.
+      # Without this window, HPA scales down at 1:00.
+      # Traffic spikes again at 1:10 (people back from lunch).
+      # With 5min window: pods stay up until 1:05, easily handle the 1:10 spike.
+
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+          # Remove at most 1 pod per 60-second period during scale-down.
+          # Very conservative — we prefer gradual scale-down to avoid
+          # under-provisioning if we misread the traffic pattern.
+          #
+          # With minReplicas=2, we can only scale down from 5→4→3→2.
+          # Each step takes 60 seconds + 300 second stabilization window.
+          # So scaling from 5 to 2 takes at least 8 minutes. That's intentional.

@@ -1,0 +1,93 @@
+# =============================================================================
+# KUBERNETES SERVICE: Backend (ClusterIP)
+# =============================================================================
+# What is a Service?
+#   A Service gives pods a stable network identity. Pods are ephemeral — they
+#   get new IP addresses every time they're created. A Service provides a
+#   single, stable IP address (called ClusterIP) and DNS name that always
+#   routes to healthy pods behind it.
+#
+# The Service constantly watches for pods matching its selector and
+# automatically updates its routing table as pods come and go.
+#
+# DNS in Kubernetes:
+#   Every Service gets a DNS entry automatically:
+#   Format: <service-name>.<namespace>.svc.cluster.local
+#   So this Service is reachable at: backend.caloriechecker-prod.svc.cluster.local
+#   Or just "backend" from within the same namespace.
+#
+# What is ClusterIP?
+#   The default Service type. Creates an internal IP address that is ONLY
+#   reachable from within the cluster. No external traffic can reach it.
+#
+#   Service types comparison:
+#   ┌─────────────────┬──────────────────────────────────────────────────┐
+#   │ ClusterIP       │ Internal only. No external access.               │
+#   │ NodePort        │ Opens a port on every node. External via node IP.│
+#   │ LoadBalancer    │ Creates a cloud load balancer. External access.  │
+#   │ ExternalName    │ Alias to an external DNS name.                   │
+#   └─────────────────┴──────────────────────────────────────────────────┘
+#
+# Why ClusterIP for the backend?
+#   The backend should NEVER be directly exposed to the internet.
+#   External traffic enters via the Ingress → goes to the frontend Service
+#   or backend Service (for /api/ paths). The Ingress is the only entry point.
+#   This is a security best practice: minimize attack surface.
+# =============================================================================
+
+apiVersion: v1   # "v1" is the core API group — includes Services, Pods, ConfigMaps
+kind: Service
+
+metadata:
+  name: backend                  # DNS name: "backend" within the namespace
+  namespace: caloriechecker-prod
+
+  labels:
+    app: backend
+    tier: backend
+
+  annotations:
+    description: "Internal ClusterIP service for Django backend — not exposed externally. Access via Ingress at /api/ and /admin/ paths only."
+    # This annotation documents the intended access pattern.
+    # Useful for developers joining the project who wonder why the service
+    # isn't reachable from outside.
+
+spec:
+  type: ClusterIP
+  # Explicitly stating ClusterIP (it's the default, but being explicit is good practice).
+  # Creates a stable virtual IP address inside the cluster's IP range.
+  # kube-proxy on every node programs iptables/IPVS rules to route traffic
+  # from this ClusterIP to one of the healthy pod IPs.
+
+  selector:
+    app: backend
+  # The Service routes traffic to ALL pods with label "app: backend".
+  # This must match the pod labels in the Deployment's template.metadata.labels.
+  # The Service continuously watches for pods with these labels and updates
+  # its endpoint list as pods start (and pass readinessProbe) or stop.
+  #
+  # Important: only pods that pass their readinessProbe are included in
+  # the endpoint list. Unhealthy pods are automatically excluded.
+
+  ports:
+    - name: http
+      # Name is optional but good practice — lets you reference this port by
+      # name in Ingress rules instead of port number.
+
+      protocol: TCP
+      # TCP is the default and what HTTP uses.
+      # Other option: UDP (for DNS, game servers, etc.)
+
+      port: 8000
+      # The port that the SERVICE listens on (inside the cluster).
+      # Other pods call: http://backend:8000/api/...
+      # This is the "virtual" port of the ClusterIP.
+
+      targetPort: 8000
+      # The port on the POD to forward traffic to.
+      # Must match the containerPort in the Deployment (port 8000 = Gunicorn).
+      # You can use a different number here — e.g., expose port 80 externally
+      # but forward to port 8000 on the pod. We use the same for simplicity.
+      #
+      # You can also use the port's name: targetPort: http
+      # (referencing the name we set in the Deployment's containerPort)

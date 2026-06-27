@@ -1,0 +1,59 @@
+# =============================================================================
+# KUBERNETES SERVICE: Frontend (ClusterIP)
+# =============================================================================
+# This Service gives the frontend pods a stable internal address.
+# The Ingress Controller uses this Service as the backend for "/" paths.
+#
+# Traffic flow for a user visiting the web app:
+#   User browser
+#     → DigitalOcean Load Balancer (external IP, port 80/443)
+#     → nginx-ingress-controller pod (routes based on path)
+#     → This Service (frontend:80) for path "/"
+#     → One of the frontend pods (Nginx serving React static files)
+#
+# Why ClusterIP (not LoadBalancer)?
+#   We only need ONE external load balancer for the entire application.
+#   That's the nginx-ingress-controller's LoadBalancer Service (created when
+#   you install nginx-ingress). It routes to either frontend or backend
+#   based on the URL path, using the rules in ingress.yaml.
+#
+#   Having separate LoadBalancers for frontend AND backend would:
+#   - Cost more (each LoadBalancer = extra DigitalOcean charge)
+#   - Require separate external IPs for API and frontend
+#   - Make CORS more complex (different domains)
+# =============================================================================
+
+apiVersion: v1
+kind: Service
+
+metadata:
+  name: frontend
+  namespace: caloriechecker-prod
+
+  labels:
+    app: frontend
+    tier: frontend
+
+  annotations:
+    description: "Internal ClusterIP service for React frontend served by Nginx. External access via Ingress at path '/'."
+
+spec:
+  type: ClusterIP
+  # Internal-only access. The Ingress Controller (also inside the cluster)
+  # forwards traffic here. No external IP is assigned.
+
+  selector:
+    app: frontend
+  # Route traffic to all pods with label "app: frontend".
+  # Only pods that have passed their readinessProbe are included.
+  # Kubernetes automatically load-balances across all healthy pods.
+
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      # The port this Service listens on inside the cluster.
+      # The Ingress rule will reference: service.name=frontend, service.port.number=80
+
+      targetPort: 80
+      # Forward to port 80 on the pods (where Nginx listens).

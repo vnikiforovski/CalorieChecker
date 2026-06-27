@@ -1,0 +1,160 @@
+# ============================================================
+# ConfigMap — caloriechecker-config
+# ============================================================
+# A ConfigMap stores non-sensitive configuration data as
+# plain text key-value pairs. It decouples configuration from
+# the container image, so you can change settings without
+# rebuilding the Docker image.
+#
+# ConfigMap vs Secret — the key distinction:
+# ┌─────────────────────────┬──────────────────────────────────┐
+# │ ConfigMap               │ Secret                           │
+# ├─────────────────────────┼──────────────────────────────────┤
+# │ Plain text (no encoding)│ base64-encoded (not encrypted)   │
+# │ Visible in kubectl      │ Visible to users with get access │
+# │ Non-sensitive config    │ Passwords, API keys, certs       │
+# │ DB name, hostnames      │ DB password, Django secret key   │
+# │ Feature flags, ports    │ OAuth tokens, TLS private keys   │
+# └─────────────────────────┴──────────────────────────────────┘
+#
+# Three ways pods can consume ConfigMaps:
+#
+# Method 1: Individual environment variable
+#   env:
+#     - name: POSTGRES_DB
+#       valueFrom:
+#         configMapKeyRef:
+#           name: caloriechecker-config
+#           key: POSTGRES_DB
+#
+# Method 2: All keys as environment variables (envFrom)
+#   envFrom:
+#     - configMapRef:
+#         name: caloriechecker-config
+#   This injects ALL keys from the ConfigMap as env vars.
+#   Use this when you want all settings available at once.
+#
+# Method 3: Mounted as files in a volume
+#   volumes:
+#     - name: config
+#       configMap:
+#         name: caloriechecker-config
+#   volumeMounts:
+#     - mountPath: /etc/config
+#       name: config
+#   Each key becomes a file: /etc/config/POSTGRES_DB, etc.
+#   Useful for nginx.conf, prometheus.yml, application.properties.
+#
+# Our backend Deployment will use Method 2 (envFrom) combined with
+# secretKeyRef for the sensitive values.
+# ============================================================
+
+apiVersion: v1
+kind: ConfigMap
+
+metadata:
+  name: caloriechecker-config   # Referenced in pod specs via configMapRef or configMapKeyRef
+  namespace: caloriechecker-prod
+
+  labels:
+    project: caloriechecker
+    environment: production
+    managed-by: kubectl
+
+  annotations:
+    description: "Non-sensitive runtime configuration for the CalorieChecker backend. Safe to inspect with kubectl."
+
+# ── data ─────────────────────────────────────────────────────
+# Plain text key-value pairs — no encoding needed.
+# All values must be strings (wrap numbers and booleans in quotes).
+#
+# Naming convention: use UPPER_SNAKE_CASE for environment variable
+# names so they can be injected directly as env vars.
+data:
+
+  # ── Database hostname ───────────────────────────────────────
+  POSTGRES_HOST: "postgres"
+  # The hostname that Django uses to connect to PostgreSQL.
+  #
+  # In Kubernetes, a Service creates a DNS entry matching its name.
+  # Our postgres Service (service.yaml) is named "postgres", so
+  # within the caloriechecker-prod namespace, "postgres" resolves
+  # to the postgres Service ClusterIP.
+  #
+  # Full qualified DNS: postgres.caloriechecker-prod.svc.cluster.local
+  # Short form (works within the same namespace): postgres
+  #
+  # This is why POSTGRES_HOST in settings.py defaults to "localhost"
+  # for local dev but we override it to "postgres" for Kubernetes.
+
+  # ── Database name ───────────────────────────────────────────
+  POSTGRES_DB: "caloriechecker"
+  # The name of the PostgreSQL database to connect to.
+  # Must match what the postgres StatefulSet creates on first start
+  # via its own POSTGRES_DB environment variable.
+  # Django's DATABASES['default']['NAME'] reads this value.
+
+  # ── Database port ───────────────────────────────────────────
+  POSTGRES_PORT: "5432"
+  # Standard PostgreSQL listening port. Almost never changes.
+  # String because ConfigMap values must be strings; Django's
+  # settings.py can cast it back to int as needed.
+
+  # ── Django debug mode ───────────────────────────────────────
+  DEBUG: "False"
+  # Django DEBUG mode MUST be False in production. Here is why:
+  #
+  # When DEBUG=True:
+  #   • Full Python stack traces are shown in HTTP error responses
+  #     (any user can see your code, file paths, and settings)
+  #   • All SQL queries are logged and kept in memory (memory leak!)
+  #   • Static files are served by Django (slow, not for production)
+  #   • ALLOWED_HOSTS validation is disabled (security risk)
+  #
+  # When DEBUG=False:
+  #   • Generic "500 Server Error" page shown to users (no code leaked)
+  #   • ALLOWED_HOSTS is enforced
+  #   • Static files must be served by Nginx (correct for production)
+
+  # ── Allowed hosts ───────────────────────────────────────────
+  DJANGO_ALLOWED_HOSTS: "*"
+  # A comma-separated list of host/domain names that Django will serve.
+  # Django checks the Host header of every incoming request against this list
+  # and returns 400 Bad Request if the host doesn't match.
+  #
+  # This is a defence against HTTP Host header injection attacks.
+  #
+  # "*" (wildcard) allows all hosts. This is ACCEPTABLE here because:
+  #   • The request reaches Django only after passing through the
+  #     DigitalOcean load balancer and Nginx ingress controller,
+  #     both of which validate and normalise the Host header.
+  #   • For stricter security, change this to your actual domain:
+  #     DJANGO_ALLOWED_HOSTS: "caloriechecker.com,www.caloriechecker.com"
+  #
+  # Note: Our settings.py reads this as:
+  #   ALLOWED_HOSTS = ['localhost', '127.0.0.1', 'backend']
+  # (hardcoded). To make it read from this env var, settings.py would need:
+  #   ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost').split(',')
+
+  # ── CORS allowed origins ────────────────────────────────────
+  CORS_ALLOWED_ORIGINS: "http://localhost,http://frontend"
+  # Cross-Origin Resource Sharing (CORS) controls which browser
+  # origins can make API requests to the Django backend.
+  #
+  # Background on CORS:
+  #   When a browser loads https://caloriechecker.com (the frontend)
+  #   and that page makes an API call to https://api.caloriechecker.com
+  #   (the backend), the browser sends a preflight OPTIONS request first.
+  #   The backend must include the right CORS headers in the response,
+  #   otherwise the browser blocks the API call.
+  #
+  # What these origins mean:
+  #   http://localhost   — Local development (Vite dev server on localhost)
+  #   http://frontend    — The nginx frontend Service within the cluster
+  #                        (when backend and frontend talk cluster-internally)
+  #
+  # For production, update this to include your real domain:
+  #   CORS_ALLOWED_ORIGINS: "https://caloriechecker.com,https://www.caloriechecker.com"
+  #
+  # Our settings.py reads CORS_ALLOWED_ORIGINS via django-cors-headers.
+  # See backend/calorie_checker/settings.py for the CORS_ALLOWED_ORIGINS list.

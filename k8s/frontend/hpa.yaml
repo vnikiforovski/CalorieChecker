@@ -1,0 +1,102 @@
+# =============================================================================
+# HORIZONTAL POD AUTOSCALER (HPA): Frontend
+# =============================================================================
+# The frontend HPA scales Nginx pods based on CPU load.
+#
+# When does frontend CPU spike?
+#   Nginx is very efficient at serving static files, so CPU is usually low.
+#   CPU spikes can happen during:
+#   - Very high concurrent user traffic (thousands of users simultaneously)
+#   - TLS handshakes (if TLS termination were moved to Nginx — it's not in our setup)
+#   - Gzip compression of large JavaScript bundles
+#
+# Frontend vs Backend HPA:
+#   - Frontend: maxReplicas=4 (lighter pods, less scaling needed)
+#   - Backend: maxReplicas=5 (more dynamic, handles computation)
+#   - Both: minReplicas=2 (always high-available)
+#
+# Note: We only scale on CPU here (not memory) because:
+#   - Nginx memory usage is very predictable and stable
+#   - Adding more Nginx pods rarely helps with memory issues
+#   - Memory pressure on Nginx usually indicates a config problem, not load
+# =============================================================================
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+
+metadata:
+  name: frontend-hpa
+  namespace: caloriechecker-prod
+
+  labels:
+    app: frontend
+    tier: frontend
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend
+    # Target the "frontend" Deployment — the HPA will adjust its replica count.
+
+  minReplicas: 2
+  # Minimum 2 pods at all times.
+  # Even at 3am with zero traffic, we keep 2 pods running for:
+  #   1. Instant response when traffic returns (no cold start delay)
+  #   2. High availability (one pod per node)
+  #   3. Pod anti-affinity requires 2 pods across 2 nodes to be effective
+
+  maxReplicas: 4
+  # Cap at 4 frontend pods.
+  # Frontend pods are cheap (100m CPU, 128Mi RAM each), but we cap at 4 because:
+  #   - Our 2-node cluster has limited total capacity
+  #   - The backend is the real bottleneck, not the frontend
+  #   - 4 Nginx pods can handle enormous traffic (millions of static file requests)
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+          # Scale up when average CPU exceeds 70% of requests (70m out of 100m).
+          # Same reasoning as backend: 70% leaves headroom for new pods to start.
+          #
+          # In practice, you might rarely hit this threshold with Nginx.
+          # If you never scale above 2 replicas in production, that's fine —
+          # it means 2 pods are handling your traffic comfortably.
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      # Wait 60 seconds before scaling up again.
+      # Prevents thrashing during momentary traffic spikes.
+
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+          # Add at most 2 pods per minute during scale-up.
+          # With maxReplicas=4 and minReplicas=2, we can go 2→4 in one step.
+          # This is faster than the backend (which scales +2 too, but from a
+          # higher base) — appropriate since frontend scales more rarely.
+
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      # Wait 5 minutes before scaling down.
+      # Same conservative approach as backend.
+      # Prevents premature scale-down after a traffic lull that might be temporary.
+      #
+      # Example: After a news article links to your app, traffic spikes.
+      # The article viewers browse for 2-3 minutes then leave.
+      # Without this window: HPA scales up then immediately back down,
+      # wasting startup time and potentially missing a second wave of traffic.
+
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+          # Remove at most 1 pod per 60 seconds during scale-down.
+          # Gradual reduction: 4 → 3 → 2 (minimum), one pod per minute.
+          # Each step waits for the 300-second stabilization window.

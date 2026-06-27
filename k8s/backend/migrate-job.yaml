@@ -1,0 +1,214 @@
+# =============================================================================
+# KUBERNETES JOB: Django Database Migrations
+# =============================================================================
+# What is a Job?
+#   A Job is a Kubernetes resource that runs a task to completion, then stops.
+#   Unlike a Deployment (which keeps pods running forever), a Job runs pods
+#   until they successfully finish. Perfect for one-time tasks like migrations.
+#
+# Why run migrations as a Job?
+#   Django migrations change the database schema (add tables, columns, etc.).
+#   They must run ONCE before the application starts, not on every restart.
+#   Running them in a Job ensures they complete before traffic hits the app.
+#
+# Typical workflow:
+#   1. Build and push new Docker image with new migration files
+#   2. Apply this Job → it migrates the database
+#   3. Apply the Deployment → new app code starts with correct DB schema
+# =============================================================================
+
+apiVersion: batch/v1   # "batch/v1" is the API group for Jobs and CronJobs
+kind: Job              # This resource type runs tasks to completion
+
+metadata:
+  name: django-migrate          # The name of this Job resource in Kubernetes
+  namespace: caloriechecker-prod # Which namespace this Job lives in (must exist first)
+
+  labels:
+    # Labels are key-value pairs for organizing and selecting resources.
+    # They don't affect behavior — they're metadata for humans and tools.
+    app: django-migrate   # Identifies the application this job belongs to
+    tier: backend         # Marks this as part of the backend tier
+
+  annotations:
+    # Annotations are also key-value metadata but intended for tools/automation
+    # rather than selectors. They can hold longer, richer information.
+    description: "This job runs database migrations before deployment"
+    # This annotation documents the purpose of this Job for anyone reading it.
+    # CI/CD pipelines (like GitHub Actions) can also read annotations.
+
+spec:
+  # =============================================================================
+  # Job-level settings
+  # =============================================================================
+
+  backoffLimit: 3
+  # If the pod fails (non-zero exit code), Kubernetes retries the job.
+  # backoffLimit: 3 means it will retry up to 3 times before giving up.
+  # Between retries, Kubernetes uses exponential backoff (10s, 20s, 40s...).
+  # If migrations fail 3 times, the Job status becomes "Failed" and you get
+  # an alert. This prevents a broken migration from running forever.
+
+  # ttlSecondsAfterFinished: 300
+  # OPTIONAL (commented out): Automatically delete the Job 300s after it finishes.
+  # Useful for keeping the cluster clean. Uncomment if you want auto-cleanup.
+  # Without this, the Job stays in the cluster (in Completed state) until deleted.
+
+  template:
+    # =============================================================================
+    # Pod Template — defines the pod that runs the migration
+    # The Job creates this pod to do the actual work.
+    # =============================================================================
+
+    metadata:
+      labels:
+        app: django-migrate   # Pod inherits these labels from the Job spec
+        tier: backend
+
+    spec:
+      # ==========================================================================
+      # restartPolicy: What should Kubernetes do if the container exits?
+      #
+      # "OnFailure" means:
+      #   - If the container exits with code 0 (success) → do NOT restart it (Job done!)
+      #   - If the container exits with non-zero code (failure) → restart it
+      #   - This is required for Jobs — "Always" is not allowed for Jobs
+      #
+      # Other options (not used here):
+      #   "Never" — never restart; each failure creates a new pod up to backoffLimit
+      #   "Always" — only for Deployments (pods that should always be running)
+      # ==========================================================================
+      restartPolicy: OnFailure
+
+      # ==========================================================================
+      # Security Context (Pod-level)
+      # Applies to ALL containers in this pod including init containers.
+      # These settings harden the pod against security exploits.
+      # ==========================================================================
+      securityContext:
+        runAsNonRoot: true
+        # Forces the container to run as a non-root user.
+        # Running as root inside a container is dangerous — if someone escapes
+        # the container, they'd have root access on the host node.
+        # Our Django image runs as user ID 1000 (set in the Dockerfile).
+
+        runAsUser: 1000
+        # The specific Linux user ID to run as.
+        # Must match the user created in our Dockerfile (e.g., "appuser").
+        # User ID 1000 is the first non-root user on most Linux systems.
+
+      # ==========================================================================
+      # INIT CONTAINERS
+      # Init containers run and complete BEFORE the main containers start.
+      # If an init container fails, Kubernetes restarts it until it succeeds.
+      # Only after ALL init containers succeed do main containers start.
+      #
+      # Why we need this:
+      #   Django's `manage.py migrate` will CRASH if PostgreSQL isn't ready yet.
+      #   PostgreSQL might still be starting up when this Job pod is created.
+      #   The init container waits until PostgreSQL accepts connections, THEN
+      #   the main container runs migrations safely.
+      # ==========================================================================
+      initContainers:
+        - name: wait-for-postgres
+          # A descriptive name — visible in `kubectl describe pod` output
+
+          image: busybox:1.35
+          # busybox is a tiny Linux image (~1MB) with common Unix utilities.
+          # We use it for the "nc" (netcat) command to test TCP connectivity.
+          # Using a specific tag (1.35) instead of "latest" ensures reproducibility.
+          # "latest" could change and break things silently.
+
+          imagePullPolicy: IfNotPresent
+          # Don't re-pull busybox if it's already on the node.
+          # Since busybox:1.35 is a fixed tag that never changes, this is safe
+          # and avoids unnecessary network traffic.
+
+          command:
+            - sh       # Run the shell interpreter
+            - -c       # Execute the following string as a shell command
+            - |
+              # This is a shell script that loops until PostgreSQL is reachable.
+              # The | means "block scalar" in YAML — everything indented below
+              # is treated as a single multi-line string.
+
+              echo "Waiting for PostgreSQL to be ready..."
+              # Print a message so we can see progress in pod logs
+
+              until nc -z postgres 5432; do
+              # "until" loops UNTIL the condition is TRUE (opposite of "while")
+              # nc = netcat, a tool for checking TCP connections
+              # -z = "zero-I/O mode" — just check if the port is open, don't send data
+              # postgres = the hostname of the PostgreSQL service (defined in postgres/service.yaml)
+              # 5432 = PostgreSQL's default port
+              # This tries to open a TCP connection to postgres:5432
+              # If it succeeds (postgres is ready), nc exits 0 → loop ends
+              # If it fails (postgres isn't ready yet), nc exits non-zero → loop continues
+
+                echo "PostgreSQL is not ready yet. Waiting 5 seconds..."
+                sleep 5
+                # Wait 5 seconds before trying again.
+                # Too short = hammers the network; too long = slow startup.
+                # 5 seconds is a good balance.
+              done
+
+              echo "PostgreSQL is ready! Starting migrations..."
+              # This prints only when the loop exits (postgres accepted our connection)
+
+      # ==========================================================================
+      # MAIN CONTAINERS
+      # These start after all init containers complete successfully.
+      # ==========================================================================
+      containers:
+        - name: django-migrate
+          # The name of this container — visible in logs and kubectl output
+
+          image: vnikiforovski0604/caloriechecker-backend:latest
+          # Our custom Django image from DockerHub.
+          # This is the same image used by the backend Deployment.
+          # It contains our Django code, manage.py, and all dependencies.
+
+          imagePullPolicy: Always
+          # Always pull the image from DockerHub before running.
+          # Critical for "latest" tags — the local node might have an old
+          # version of "latest" cached. Always ensures we run the newest code.
+          # (For versioned tags like "v1.2.3", IfNotPresent is usually better.)
+
+          command:
+            - python
+            - manage.py
+            - migrate
+            - --noinput
+          # Override the Docker image's default CMD with this specific command.
+          # "python manage.py migrate" runs all pending Django migrations.
+          # "--noinput" means "don't ask for confirmation" — required for automation
+          # since there's no human to press Enter in a Job container.
+
+          # ==========================================================================
+          # ENVIRONMENT VARIABLES
+          # Django needs these to connect to PostgreSQL and configure itself.
+          # We load them from a Secret (sensitive) and ConfigMap (non-sensitive).
+          #
+          # envFrom loads ALL keys from a Secret/ConfigMap as env vars at once.
+          # This is cleaner than listing each variable individually with "env:".
+          # ==========================================================================
+          envFrom:
+            - secretRef:
+                name: caloriechecker-secrets
+              # Load ALL keys from the "caloriechecker-secrets" Secret as env vars.
+              # This injects:
+              #   DJANGO_SECRET_KEY     — Django's cryptographic signing key
+              #   POSTGRES_PASSWORD     — PostgreSQL password for the app user
+              #   ANTHROPIC_API_KEY     — API key for Claude AI (not needed for migrate,
+              #                           but including it avoids Django startup errors
+              #                           if settings.py reads it at import time)
+              #   POSTGRES_USER         — PostgreSQL username
+
+            - configMapRef:
+                name: caloriechecker-config
+              # Load ALL keys from the ConfigMap as env vars.
+              # This injects:
+              #   POSTGRES_DB    — Database name (e.g., "caloriechecker")
+              #   POSTGRES_HOST  — Hostname of postgres (e.g., "postgres")
+              #   POSTGRES_PORT  — Port of postgres (e.g., "5432")
+              #   DEBUG          — Django debug mode ("False" in production)

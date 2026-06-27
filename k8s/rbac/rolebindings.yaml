@@ -1,0 +1,256 @@
+# ============================================================
+# ServiceAccounts and Role Bindings
+# ============================================================
+# Now that we have Roles defined (roles.yaml), we need to
+# BIND them to identities. A Role sitting alone does nothing —
+# it must be bound to a subject.
+#
+# Three types of subjects in Kubernetes RBAC:
+#
+#   User          — A human authenticated by the cluster's
+#                   identity provider (certificates, OIDC, etc.)
+#                   K8s does NOT manage users directly; they are
+#                   provided by an external system.
+#
+#   Group         — A named set of Users. Useful for granting
+#                   permissions to "all developers" at once.
+#                   Also provided by external identity systems.
+#
+#   ServiceAccount — An identity for a POD (not a human).
+#                    These ARE managed by Kubernetes directly.
+#                    Pods reference a SA to make API server calls.
+#                    K8s auto-mounts a token into the pod.
+#
+# We use ServiceAccounts because:
+#   • They are namespaced K8s resources (create/delete with kubectl)
+#   • Kubernetes handles token creation and rotation automatically
+#   • Pods can reference them by name: spec.serviceAccountName
+#   • Fine-grained RBAC via RoleBinding per ServiceAccount
+#   • Works well for CI/CD: the pipeline runs as a SA with developer role
+#
+# File layout:
+#   1. ServiceAccount: caloriechecker-reader   (in prod namespace)
+#   2. ServiceAccount: caloriechecker-developer (in prod namespace)
+#   3. ServiceAccount: caloriechecker-admin    (in prod namespace)
+#   4. ServiceAccount: caloriechecker-monitoring (in monitoring namespace)
+#   5. RoleBinding: reader role → reader SA
+#   6. RoleBinding: developer role → developer SA
+#   7. RoleBinding: admin role → admin SA
+#   8. ClusterRoleBinding: monitoring-reader ClusterRole → monitoring SA
+# ============================================================
+
+# ── ServiceAccount 1: caloriechecker-reader ──────────────────
+# Used by pods that only need read access to the prod namespace.
+# Examples: a sidecar container that reads ConfigMaps to reload
+# config, or a log shipper that reads pod metadata.
+#
+# Any pod that sets:
+#   spec.serviceAccountName: caloriechecker-reader
+# will automatically have a mounted token with reader permissions.
+apiVersion: v1
+kind: ServiceAccount   # ServiceAccounts are core (v1) resources
+
+metadata:
+  name: caloriechecker-reader
+  namespace: caloriechecker-prod   # ServiceAccounts are namespace-scoped
+
+  labels:
+    project: caloriechecker
+    environment: production
+    rbac-tier: reader
+
+  annotations:
+    description: "Read-only ServiceAccount for monitoring agents and log shippers"
+
+# Note: No `automountServiceAccountToken: false` here because we DO
+# want the token mounted for pods that use this SA.
+# If you create a SA purely as a binding subject and never use it in a
+# pod, add: automountServiceAccountToken: false  (security best practice)
+
+---
+# ── ServiceAccount 2: caloriechecker-developer ───────────────
+# Used by CI/CD pipelines and automated deployment tools.
+# The GitHub Actions CD pipeline authenticates with this SA
+# to roll out new image versions via `kubectl set image`.
+apiVersion: v1
+kind: ServiceAccount
+
+metadata:
+  name: caloriechecker-developer
+  namespace: caloriechecker-prod
+
+  labels:
+    project: caloriechecker
+    environment: production
+    rbac-tier: developer
+
+  annotations:
+    description: "Developer ServiceAccount for CI/CD pipelines (GitHub Actions)"
+
+---
+# ── ServiceAccount 3: caloriechecker-admin ───────────────────
+# Used for administrative tasks requiring full namespace access.
+# Should NOT be used by automated pipelines — only humans for
+# break-glass or maintenance operations.
+apiVersion: v1
+kind: ServiceAccount
+
+metadata:
+  name: caloriechecker-admin
+  namespace: caloriechecker-prod
+
+  labels:
+    project: caloriechecker
+    environment: production
+    rbac-tier: admin
+
+  annotations:
+    description: "Admin ServiceAccount — full namespace access. Use only for administrative tasks."
+
+---
+# ── ServiceAccount 4: caloriechecker-monitoring ──────────────
+# Lives in the MONITORING namespace (not prod).
+# Prometheus, Grafana, and other monitoring tools use this SA.
+# It will be granted the caloriechecker-monitoring-reader
+# ClusterRole (see ClusterRoleBinding below) so it can read
+# resources from ALL namespaces.
+apiVersion: v1
+kind: ServiceAccount
+
+metadata:
+  name: caloriechecker-monitoring
+  namespace: caloriechecker-monitoring   # Different namespace — monitoring tools live here
+
+  labels:
+    project: caloriechecker
+    environment: monitoring
+    rbac-tier: monitoring
+
+  annotations:
+    description: "ServiceAccount for Prometheus and Grafana to scrape cluster-wide metrics"
+
+---
+# ── RoleBinding 1: reader-binding ────────────────────────────
+# A RoleBinding CONNECTS a Role to one or more subjects.
+# This binding says:
+#   "The caloriechecker-reader ServiceAccount receives the
+#    permissions defined in the caloriechecker-reader Role,
+#    but ONLY within the caloriechecker-prod namespace."
+#
+# Visual flow:
+#   SA (caloriechecker-reader)
+#     ──[RoleBinding]──► Role (caloriechecker-reader)
+#                            └─ can: get,list,watch pods, services, etc.
+#                               ONLY in: caloriechecker-prod namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding   # RoleBinding is namespace-scoped (unlike ClusterRoleBinding)
+
+metadata:
+  name: caloriechecker-reader-binding
+  namespace: caloriechecker-prod   # Both the binding and the Role live in this namespace
+
+# roleRef defines WHAT permissions to grant.
+# Once set, roleRef is IMMUTABLE — you cannot change it without
+# deleting and recreating the RoleBinding.
+roleRef:
+  apiGroup: rbac.authorization.k8s.io   # Always this value for RBAC resources
+  kind: Role                             # We're referencing a namespaced Role
+  name: caloriechecker-reader           # Must match the Role's metadata.name exactly
+
+# subjects lists WHO receives the permissions.
+# A single RoleBinding can bind to multiple subjects at once.
+subjects:
+  - kind: ServiceAccount              # We're binding to a ServiceAccount
+    name: caloriechecker-reader       # Must match the SA's metadata.name
+    namespace: caloriechecker-prod    # Required for ServiceAccount subjects —
+                                       # specifies which namespace the SA lives in
+
+---
+# ── RoleBinding 2: developer-binding ─────────────────────────
+# Grants the developer role to the developer ServiceAccount.
+# The GitHub Actions CD workflow can use this SA's token to
+# run kubectl commands against the prod namespace.
+#
+# To create a long-lived token for CI (K8s 1.24+):
+#   kubectl create token caloriechecker-developer \
+#     -n caloriechecker-prod \
+#     --duration=8760h   # 1 year
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+
+metadata:
+  name: caloriechecker-developer-binding
+  namespace: caloriechecker-prod
+
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: caloriechecker-developer   # References the developer Role from roles.yaml
+
+subjects:
+  - kind: ServiceAccount
+    name: caloriechecker-developer
+    namespace: caloriechecker-prod
+
+---
+# ── RoleBinding 3: admin-binding ─────────────────────────────
+# Grants full namespace admin to the admin ServiceAccount.
+# Only bind this to the minimum number of identities.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+
+metadata:
+  name: caloriechecker-admin-binding
+  namespace: caloriechecker-prod
+
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: caloriechecker-admin   # References the admin Role from roles.yaml
+
+subjects:
+  - kind: ServiceAccount
+    name: caloriechecker-admin
+    namespace: caloriechecker-prod
+
+---
+# ── ClusterRoleBinding: monitoring-reader-binding ────────────
+# A ClusterRoleBinding grants a ClusterRole to a subject with
+# CLUSTER-WIDE scope. The monitoring SA can read pods, nodes,
+# and services from ANY namespace in the cluster.
+#
+# This is the key difference from a RoleBinding:
+#   RoleBinding     → permissions apply in ONE namespace only
+#   ClusterRoleBinding → permissions apply in ALL namespaces
+#
+# Why this is safe even though it's broad:
+#   The caloriechecker-monitoring-reader ClusterRole only grants
+#   READ permissions (get, list, watch) — no write access at all.
+#   Prometheus can see everything but change nothing.
+#
+# Security note:
+#   Even read access to Secrets across all namespaces would be
+#   dangerous. Our monitoring ClusterRole does NOT include Secrets
+#   in its rules for this reason.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding   # No namespace field — this is cluster-scoped
+
+metadata:
+  name: caloriechecker-monitoring-reader-binding
+  # No namespace — ClusterRoleBindings live at the cluster level
+  labels:
+    project: caloriechecker
+    rbac-tier: monitoring
+
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole                          # References a ClusterRole (not Role)
+  name: caloriechecker-monitoring-reader    # From roles.yaml
+
+subjects:
+  # The monitoring ServiceAccount is in caloriechecker-monitoring,
+  # but via ClusterRoleBinding it gets cluster-wide read permissions.
+  - kind: ServiceAccount
+    name: caloriechecker-monitoring          # The SA we created above
+    namespace: caloriechecker-monitoring     # Which namespace the SA lives in
+                                              # (Required even for ClusterRoleBinding)

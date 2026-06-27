@@ -1,0 +1,109 @@
+# ============================================================
+# Monitoring Namespace — caloriechecker-monitoring
+# ============================================================
+# This namespace hosts the observability stack that watches
+# caloriechecker-prod and caloriechecker-staging:
+#
+#   Prometheus    — scrapes metrics from all pods & nodes
+#   Grafana       — visualises metrics in dashboards
+#   Alertmanager  — routes alerts to Slack/email/PagerDuty
+#   (Optional) Loki       — aggregates and queries pod logs
+#   (Optional) Jaeger     — distributed request tracing
+#
+# Why a dedicated monitoring namespace?
+#
+# 1. Elevated permissions without contaminating app namespaces
+#    Prometheus needs ClusterRole access to scrape metrics from
+#    ALL namespaces. Keeping it isolated makes those elevated
+#    permissions explicit and auditable rather than hidden inside
+#    an application namespace.
+#
+# 2. Independent resource budget
+#    Prometheus is memory-hungry (keeps time-series in RAM).
+#    If Prometheus and the Django backend shared a namespace,
+#    a tight ResourceQuota might accidentally OOMKill Prometheus
+#    during an incident — exactly when you need it most.
+#
+# 3. Access control separation
+#    Ops engineers need Grafana access. They should NOT
+#    automatically get access to production app secrets.
+#    Keeping monitoring separate makes RBAC cleaner.
+#
+# 4. Lifecycle independence
+#    You can redeploy the entire app stack without touching
+#    monitoring, or upgrade Grafana without risking prod.
+# ============================================================
+
+apiVersion: v1
+kind: Namespace
+
+metadata:
+  name: caloriechecker-monitoring
+
+  labels:
+    environment: monitoring   # Distinct from production/staging — this is infrastructure
+    project: caloriechecker
+    managed-by: kubectl
+
+  annotations:
+    description: "Monitoring namespace: Prometheus, Grafana, Alertmanager for CalorieChecker"
+    owner: "viktor@caloriechecker.com"
+    created-by: "kubectl apply"
+
+---
+# ============================================================
+# ResourceQuota — monitoring-quota
+# ============================================================
+# Monitoring tools need enough memory to hold metric history
+# and enough pods for the full observability stack.
+#
+# Typical resource usage:
+#   Prometheus:   requests: 500m CPU, 512Mi RAM (stores metrics in memory)
+#   Grafana:      requests: 100m CPU, 128Mi RAM
+#   Alertmanager: requests: 100m CPU, 64Mi RAM
+#   kube-exporter:requests: 50m CPU, 64Mi RAM (per node)
+#   Total ≈ 750m CPU, 768Mi RAM for a minimal setup
+#
+# We allocate 2 CPU / 2Gi RAM to leave headroom for Prometheus'
+# metric history growth and additional exporters.
+# ============================================================
+
+apiVersion: v1
+kind: ResourceQuota
+
+metadata:
+  name: monitoring-quota
+  namespace: caloriechecker-monitoring
+
+spec:
+  hard:
+    pods: "10"
+    # Enough pods for:
+    #   Prometheus (1), Grafana (1), Alertmanager (1),
+    #   node-exporter DaemonSet (1 per node × 2 nodes = 2),
+    #   kube-state-metrics (1), spare capacity (4)
+
+    requests.cpu: "2"
+    # Monitoring is not CPU-intensive (it mainly reads and stores data).
+    # 2 cores is comfortable for the full stack.
+
+    requests.memory: "2Gi"
+    # Prometheus keeps its time-series data in memory.
+    # With default 15-day retention and a small cluster, 1Gi for
+    # Prometheus + 1Gi for others is enough.
+
+    limits.cpu: "4"
+    limits.memory: "4Gi"
+
+    persistentvolumeclaims: "3"
+    # Prometheus data volume + Grafana data volume + Alertmanager volume
+
+    services: "5"
+    # Prometheus Service + Grafana Service + Alertmanager Service + spare
+
+    secrets: "10"
+    # Grafana admin credentials, notification webhook URLs, etc.
+
+    configmaps: "10"
+    # Prometheus scrape config, Grafana datasources, Grafana dashboards
+    # (Grafana can load dashboard JSON from ConfigMaps)

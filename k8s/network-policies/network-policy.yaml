@@ -1,0 +1,380 @@
+# ============================================================
+# NetworkPolicies — caloriechecker-prod
+# ============================================================
+# A NetworkPolicy is a Kubernetes resource that controls the
+# network traffic flowing to and from pods using firewall-like rules.
+#
+# KEY CONCEPT: NetworkPolicies are ADDITIVE — they add permissions.
+#
+# Default behaviour WITHOUT any NetworkPolicy:
+#   All traffic is ALLOWED (open network — any pod talks to any pod).
+#
+# Behaviour once a pod is SELECTED by ANY NetworkPolicy:
+#   ONLY the traffic explicitly permitted by that (or any other)
+#   NetworkPolicy selecting this pod is allowed.
+#   Everything else is denied.
+#
+# This is why we start with a "deny-all" policy that selects ALL pods,
+# and then add specific "allow-*" policies to open exactly the
+# connections we need. This is called "default-deny" or "zero-trust".
+#
+# ── Requirements ─────────────────────────────────────────────
+# NetworkPolicies require a CNI (Container Network Interface) plugin
+# that supports them. DigitalOcean Kubernetes uses Cilium as its
+# CNI, which fully supports NetworkPolicies.
+#
+# Common CNIs and NetworkPolicy support:
+#   Cilium  ✅ (DigitalOcean default — full support including L7)
+#   Calico  ✅ (also popular, full support)
+#   Flannel ❌ (no NetworkPolicy support — common in bare-metal setups)
+#   Weave   ✅ (support, but less popular)
+#
+# ── How matching works ────────────────────────────────────────
+# A NetworkPolicy has three key selectors:
+#
+#   podSelector    — which pods does this policy APPLY TO?
+#                    (empty {} means all pods in the namespace)
+#
+#   ingress rules  — for INCOMING traffic: which sources are allowed?
+#                    Defined by: namespaceSelector, podSelector, ipBlock
+#
+#   egress rules   — for OUTGOING traffic: which destinations are allowed?
+#                    Defined by: namespaceSelector, podSelector, ipBlock
+#
+# ── Our traffic model ─────────────────────────────────────────
+# Internet ──► Ingress Controller ──► Frontend (port 80)
+# Internet ──► Ingress Controller ──► Backend API (port 8000)
+# Frontend ──► Backend (port 8000)
+# Backend  ──► PostgreSQL (port 5432)
+# Backend  ──► Internet (Anthropic API, port 443)
+# All pods ──► kube-dns (port 53 UDP/TCP, for name resolution)
+# All other traffic: DENIED
+# ============================================================
+
+# ── Policy 1: Default Deny All ───────────────────────────────
+# The foundation of zero-trust networking.
+#
+# Selecting ALL pods with an empty podSelector ({}) and listing
+# both Ingress and Egress policy types WITHOUT any rules means:
+#   "For ALL pods: deny ALL incoming AND outgoing traffic."
+#
+# After this policy, no pod can:
+#   • Receive connections from anywhere
+#   • Connect to other pods
+#   • Reach the internet
+#   • Even resolve DNS names (we fix this with allow-dns below)
+#
+# Every subsequent "allow-*" policy punches a hole in this wall.
+apiVersion: networking.k8s.io/v1   # NetworkPolicies are in the networking.k8s.io API group
+kind: NetworkPolicy
+
+metadata:
+  name: deny-all
+  namespace: caloriechecker-prod
+
+  annotations:
+    description: "Default deny-all for all pods. All allow-* policies add exceptions to this baseline."
+    order: "1-baseline"   # Custom annotation for documentation ordering
+
+spec:
+  podSelector: {}   # {} means "select ALL pods in this namespace".
+                     # This is the special syntax for "match everything".
+                     # Contrast with: {matchLabels: {app: backend}} which selects only backend pods.
+
+  # Listing both policy types with no rules = deny everything.
+  # policyTypes declares which traffic DIRECTIONS this policy controls.
+  policyTypes:
+    - Ingress   # This policy controls incoming traffic to selected pods
+    - Egress    # This policy controls outgoing traffic from selected pods
+  # Note: No `ingress:` block and no `egress:` block = no traffic allowed.
+  # If we wrote `ingress: []` (empty list) it means the same thing.
+
+---
+# ── Policy 2: Allow Frontend → Backend ───────────────────────
+# The React frontend (served by Nginx in the frontend container)
+# proxies API calls to the Django backend at port 8000.
+# Without this policy, the Nginx reverse proxy would time out
+# trying to reach the backend.
+#
+# APPLIES TO: backend pods (labeled app=backend)
+# ALLOWS IN:  traffic from frontend pods (labeled app=frontend) on TCP/8000
+#
+# This works because:
+#   1. This policy ADDS to the deny-all for backend pods
+#   2. Only frontend pods (not postgres, not random pods) can connect
+#   3. Only port 8000 is opened (not 22, not 5432, not anything else)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+
+metadata:
+  name: allow-frontend-to-backend
+  namespace: caloriechecker-prod
+  annotations:
+    description: "Frontend pods can reach the Django backend on port 8000"
+    order: "2-app-traffic"
+
+spec:
+  # This policy applies to pods labeled app=backend
+  podSelector:
+    matchLabels:
+      app: backend   # Must match backend Deployment's pod template labels
+
+  policyTypes:
+    - Ingress   # We're controlling who can SEND traffic to backend pods
+
+  ingress:
+    # Each item in ingress[] defines an allowed traffic source.
+    - from:
+        # podSelector here means: only pods with app=frontend label
+        # in the SAME namespace can initiate a connection.
+        # If a pod has app=frontend but is in a different namespace,
+        # it CANNOT connect (unless you also add a namespaceSelector).
+        - podSelector:
+            matchLabels:
+              app: frontend   # Only the Nginx frontend container can call the API
+
+      # ports[] lists which ports on the BACKEND pod are accessible.
+      ports:
+        - protocol: TCP
+          port: 8000   # Django/Gunicorn listens on port 8000
+
+---
+# ── Policy 3: Allow Backend → PostgreSQL ─────────────────────
+# Django needs to make database queries to PostgreSQL.
+# This policy opens port 5432 on postgres pods but ONLY for
+# traffic coming from backend pods. No other pod can connect
+# to PostgreSQL directly.
+#
+# APPLIES TO: postgres pods (labeled app=postgres)
+# ALLOWS IN:  traffic from backend pods (labeled app=backend) on TCP/5432
+#
+# Why protect PostgreSQL with NetworkPolicy even though it's ClusterIP?
+# ClusterIP means it's not reachable FROM OUTSIDE the cluster, but any
+# pod INSIDE the cluster could connect to it. NetworkPolicy restricts
+# it to only the backend pods that actually need database access.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+
+metadata:
+  name: allow-backend-to-postgres
+  namespace: caloriechecker-prod
+  annotations:
+    description: "Backend pods can reach PostgreSQL on port 5432. No other pods can."
+    order: "2-app-traffic"
+
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres   # Applies to the postgres StatefulSet pod
+
+  policyTypes:
+    - Ingress
+
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: backend   # Only backend pods can query the database
+
+      ports:
+        - protocol: TCP
+          port: 5432   # Standard PostgreSQL port
+
+---
+# ── Policy 4: Allow Ingress Controller → Frontend ────────────
+# The NGINX Ingress Controller receives external HTTP traffic
+# from the DigitalOcean Load Balancer and forwards it to the
+# appropriate backend Service based on the Ingress rules.
+#
+# For the frontend, it forwards traffic to the frontend pods on port 80.
+#
+# APPLIES TO: frontend pods (labeled app=frontend)
+# ALLOWS IN:  traffic from the ingress-nginx namespace on TCP/80
+#
+# We use namespaceSelector here (not podSelector) because:
+#   • The ingress controller is in a DIFFERENT namespace (ingress-nginx)
+#   • We need to allow traffic from any pod in that namespace
+#   • The namespace is labeled: kubernetes.io/metadata.name=ingress-nginx
+#     (K8s automatically adds this label to every namespace)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+
+metadata:
+  name: allow-ingress-to-frontend
+  namespace: caloriechecker-prod
+  annotations:
+    description: "NGINX Ingress Controller can forward HTTP traffic to frontend pods on port 80"
+    order: "3-ingress-traffic"
+
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend   # Applies to frontend Nginx pods
+
+  policyTypes:
+    - Ingress
+
+  ingress:
+    - from:
+        # namespaceSelector matches the ingress-nginx namespace.
+        # Kubernetes automatically adds the label
+        # kubernetes.io/metadata.name=<namespace-name> to every namespace.
+        # This is the safest way to target a specific namespace.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+              # If your ingress controller is in a different namespace
+              # (e.g., "nginx-ingress"), update this value accordingly.
+              # Check: kubectl get namespaces --show-labels
+
+      ports:
+        - protocol: TCP
+          port: 80   # Nginx in the frontend container serves on port 80
+
+---
+# ── Policy 5: Allow Ingress Controller → Backend ─────────────
+# Some Ingress configurations route /api/* requests directly to
+# the Django backend, bypassing the frontend Nginx entirely.
+# This policy opens that path.
+#
+# APPLIES TO: backend pods (labeled app=backend)
+# ALLOWS IN:  traffic from ingress-nginx namespace on TCP/8000
+#
+# Note: This works alongside allow-frontend-to-backend.
+# The backend can accept traffic from BOTH the ingress controller
+# AND from frontend pods — both policies apply simultaneously.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+
+metadata:
+  name: allow-ingress-to-backend
+  namespace: caloriechecker-prod
+  annotations:
+    description: "NGINX Ingress Controller can forward /api/* requests to backend pods on port 8000"
+    order: "3-ingress-traffic"
+
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+
+  policyTypes:
+    - Ingress
+
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+
+      ports:
+        - protocol: TCP
+          port: 8000
+
+---
+# ── Policy 6: Allow DNS Resolution ───────────────────────────
+# This is the most commonly forgotten NetworkPolicy rule.
+#
+# Without DNS, pods cannot resolve Service names:
+#   "postgres" → ??? (no DNS = can't find the IP)
+#   "backend"  → ???
+#
+# CoreDNS (kube-dns) runs in the kube-system namespace and provides
+# DNS resolution for all Kubernetes Service names. It listens on
+# port 53 for both UDP (standard queries) and TCP (large responses).
+#
+# APPLIES TO: ALL pods (empty podSelector)
+# ALLOWS OUT: to the kube-system namespace on UDP/53 and TCP/53
+#
+# Why both UDP AND TCP?
+#   DNS uses UDP for queries that fit in 512 bytes (most queries).
+#   DNS uses TCP for large responses (e.g., querying many records).
+#   Kubernetes CoreDNS supports both; we allow both.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+
+metadata:
+  name: allow-dns
+  namespace: caloriechecker-prod
+  annotations:
+    description: "All pods can reach CoreDNS (kube-dns) in kube-system for name resolution. Required for Service DNS to work."
+    order: "4-infrastructure"
+
+spec:
+  podSelector: {}   # ALL pods — every pod needs DNS resolution
+
+  policyTypes:
+    - Egress   # DNS lookups are OUTGOING connections from our pods TO kube-dns
+
+  egress:
+    - to:
+        # Target the kube-system namespace where CoreDNS (kube-dns) runs.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+
+      ports:
+        - protocol: UDP
+          port: 53   # DNS over UDP (standard, used for most queries)
+        - protocol: TCP
+          port: 53   # DNS over TCP (used for large responses, DNSSEC, zone transfers)
+
+---
+# ── Policy 7: Allow Backend Egress to Internet ───────────────
+# The Django backend makes outbound HTTPS calls to the Anthropic
+# API (https://api.anthropic.com) for the meal analysis feature.
+# Without this policy, those calls would be silently blocked
+# by the deny-all policy, causing 503 errors in the app.
+#
+# APPLIES TO: backend pods (labeled app=backend)
+# ALLOWS OUT: to any public IP on TCP/80 and TCP/443
+#
+# Why only backend pods, not frontend?
+#   The Nginx frontend container only serves static files and proxies
+#   to the backend — it has no reason to call external APIs.
+#   Least privilege: only grant internet access to pods that need it.
+#
+# The `except` list:
+#   We allow 0.0.0.0/0 (all internet) but EXCLUDE private IP ranges
+#   (RFC 1918). This prevents the backend from bypassing internal
+#   NetworkPolicies by using raw pod IPs instead of Service names.
+#   For example, without this exclusion, the backend could dial
+#   10.244.0.5:5432 directly to reach postgres, bypassing the
+#   allow-backend-to-postgres policy's label-based filtering.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+
+metadata:
+  name: allow-backend-egress-internet
+  namespace: caloriechecker-prod
+  annotations:
+    description: "Backend pods can reach public internet (Anthropic API) on HTTP/HTTPS. Private ranges excluded."
+    order: "5-egress"
+
+spec:
+  podSelector:
+    matchLabels:
+      app: backend   # Only backend pods need internet egress for AI API calls
+
+  policyTypes:
+    - Egress   # We're controlling outgoing traffic FROM backend pods
+
+  egress:
+    - to:
+        # ipBlock matches a CIDR range of IP addresses.
+        # 0.0.0.0/0 = the entire IPv4 address space (the whole internet).
+        # The `except` list subtracts private ranges from this allowance.
+        - ipBlock:
+            cidr: 0.0.0.0/0    # Allow any destination IP...
+            except:
+              - 10.0.0.0/8      # ...except RFC 1918 private range (pod + service CIDR)
+              - 172.16.0.0/12   # ...except RFC 1918 private range (often Docker/K8s internal)
+              - 192.168.0.0/16  # ...except RFC 1918 private range (home/office networks)
+              # Together, these three ranges cover all commonly-used private IP space.
+              # Traffic to these ranges must go through proper K8s Services, not raw IPs.
+
+      ports:
+        - protocol: TCP
+          port: 80    # HTTP — used for some API discovery or redirect endpoints
+        - protocol: TCP
+          port: 443   # HTTPS — Anthropic API and all production external calls use TLS
