@@ -1,42 +1,4 @@
-# =============================================================================
-# POD DISRUPTION BUDGET (PDB): Backend
-# =============================================================================
-# What is a PodDisruptionBudget?
-#   A PDB limits the number of pods that can be simultaneously unavailable
-#   during VOLUNTARY disruptions (planned maintenance, node drains, etc.).
-#
-# What are "voluntary disruptions"?
-#   Operations that a human or controller intentionally initiates:
-#   - `kubectl drain node` (for node maintenance or upgrades)
-#   - Cluster upgrades (DigitalOcean upgrading Kubernetes version)
-#   - Node scaling down (removing a node from the cluster)
-#   - Manual pod deletions during testing
-#
-# What about "involuntary disruptions"?
-#   These are things outside our control and PDB does NOT protect against:
-#   - Hardware failures
-#   - Node kernel panics
-#   - Out-of-memory kills on the node
-#   - Pod being killed due to exceeding its own memory limit
-#
-# How does it work?
-#   Before a controller (like the node drainer) can evict a pod, it checks:
-#   "Will evicting this pod violate the PDB?"
-#   If yes → it WAITS until conditions allow the eviction safely.
-#   If no → it proceeds with eviction.
-#
-# Real-world example:
-#   DigitalOcean wants to perform node maintenance on node-1.
-#   It runs `kubectl drain node-1` which tries to evict all pods on node-1.
-#   We have 2 backend pods: one on node-1, one on node-2.
-#   Without PDB: both pods could theoretically be evicted simultaneously → outage.
-#   With PDB (minAvailable: 1): Kubernetes ensures 1 pod stays running at all times.
-#   So it evicts the pod on node-1, waits for a replacement to start on node-2,
-#   then considers the drain complete.
-# =============================================================================
-
-apiVersion: policy/v1   # "policy/v1" is the API group for PodDisruptionBudgets
-                         # (v1beta1 was deprecated in Kubernetes 1.21)
+apiVersion: policy/v1
 kind: PodDisruptionBudget
 
 metadata:
@@ -48,36 +10,8 @@ metadata:
     tier: backend
 
 spec:
-  # =============================================================================
-  # DISRUPTION POLICY
-  # Choose ONE of: minAvailable OR maxUnavailable (not both)
-  # =============================================================================
-
   minAvailable: 1
-  # Guarantee that AT LEAST 1 backend pod is always running during maintenance.
-  #
-  # With our replicas=2 setup:
-  #   - minAvailable: 1 → allows 1 pod to be disrupted at a time (50%)
-  #   - During a drain: pod 1 evicted → replacement starts → pod 2 may be evicted
-  #   - At no point are both pods down simultaneously
-  #
-  # Alternative: maxUnavailable: 1
-  # This has the same effect when replicas=2, but behaves differently at scale:
-  #   - maxUnavailable: 1 → always allow exactly 1 pod to be down
-  #   - minAvailable: 1   → always keep at least 1 pod up (regardless of total)
-  #
-  # We use minAvailable because it's more intuitive for SLA reasoning:
-  # "I need at least N pods to serve traffic" is a clearer requirement
-  # than "I allow at most N pods to be disrupted."
-  #
-  # Could you use minAvailable: 2?
-  #   With replicas=2, this would mean ZERO pods can EVER be evicted.
-  #   Node maintenance would be impossible (drain would hang forever).
-  #   Don't do this unless you have 3+ replicas and want stricter protection.
 
   selector:
     matchLabels:
       app: backend
-    # This PDB protects pods with label "app: backend".
-    # Must match the Deployment's pod template labels.
-    # The PDB only counts pods matching this selector when checking minAvailable.

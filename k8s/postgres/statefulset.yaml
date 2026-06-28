@@ -1,42 +1,13 @@
-# ============================================================
-# StatefulSet — PostgreSQL 15
-# ============================================================
-# Why StatefulSet instead of Deployment?
-#
-# ┌─────────────────────────┬──────────────────────────────────┐
-# │ Deployment              │ StatefulSet                      │
-# ├─────────────────────────┼──────────────────────────────────┤
-# │ Stateless pods          │ Stateful pods                    │
-# │ Random names: pod-xk2p  │ Stable names: postgres-0         │
-# │ Shared or no volumes    │ Each pod gets its OWN PVC        │
-# │ Pods are interchangeable│ Pods have stable identity        │
-# │ All start simultaneously│ Pods start/stop in order (0,1,2) │
-# │ web servers, APIs       │ Databases, Zookeeper, Kafka      │
-# └─────────────────────────┴──────────────────────────────────┘
-#
-# PostgreSQL requires StatefulSet because:
-#   1. Data MUST persist across pod restarts → PVC per pod
-#   2. Two instances CANNOT write to the same data dir simultaneously
-#      (data corruption) → ordered pod management
-#   3. In multi-replica setups, the primary (postgres-0) must be
-#      identifiable → stable pod names
-#   4. Replication requires stable network identities (headless Service)
-#
-# This StatefulSet runs a SINGLE primary PostgreSQL instance (1 replica).
-# Adding read replicas for HA would require a PostgreSQL operator like
-# Patroni, CloudNativePG, or Zalando's postgres-operator.
-# ============================================================
-
-apiVersion: apps/v1    # StatefulSets are in the "apps" API group (apps/v1)
+apiVersion: apps/v1
 kind: StatefulSet
 
 metadata:
-  name: postgres               # Base name for pods: postgres-0, postgres-1, ...
+  name: postgres
   namespace: caloriechecker-prod
 
   labels:
-    app: postgres              # Used by Service selector to route traffic here
-    tier: database             # Architectural layer label
+    app: postgres
+    tier: database
     environment: production
 
   annotations:
@@ -44,47 +15,20 @@ metadata:
     managed-by: kubectl
 
 spec:
-  # ── Service Name ─────────────────────────────────────────────
-  # Every StatefulSet requires a "governing Service" — typically a
-  # headless Service (clusterIP: None). This Service creates DNS
-  # records for each individual pod:
-  #   postgres-0.postgres.caloriechecker-prod.svc.cluster.local
-  #   postgres-1.postgres.caloriechecker-prod.svc.cluster.local
-  # This is essential for multi-replica setups where pods need to
-  # communicate with each other directly (e.g., replication).
-  # See service.yaml for the regular ClusterIP Service that
-  # Django uses to connect (just "postgres").
   serviceName: postgres
-
-  # ── Replicas ─────────────────────────────────────────────────
-  # 1 = single primary PostgreSQL instance (no standby replicas).
-  # For high availability, you would run 3 replicas with a postgres
-  # operator managing leader election and failover.
   replicas: 1
 
-  # ── Update Strategy ──────────────────────────────────────────
-  # RollingUpdate replaces pods one at a time starting from the
-  # highest ordinal (postgres-N, then N-1, ..., then postgres-0).
-  # With only 1 replica, this means brief downtime during updates.
   updateStrategy:
     type: RollingUpdate
 
-  # ── Selector ─────────────────────────────────────────────────
-  # The StatefulSet controller uses this label selector to identify
-  # which pods belong to it. This MUST match the pod template labels.
-  # If they don't match, the StatefulSet controller will be confused
-  # and the API server will reject the manifest.
   selector:
     matchLabels:
-      app: postgres   # Must match spec.template.metadata.labels.app
+      app: postgres
 
-  # ── Pod Template ─────────────────────────────────────────────
-  # Defines the pod blueprint. The StatefulSet uses this to create
-  # postgres-0 (and postgres-1, etc. if replicas > 1).
   template:
     metadata:
       labels:
-        app: postgres           # MUST match spec.selector.matchLabels
+        app: postgres
         tier: database
         environment: production
 
@@ -92,113 +36,37 @@ spec:
         description: "PostgreSQL 15 pod — reads credentials from Secret, config from ConfigMap"
 
     spec:
-      # ── Termination Grace Period ─────────────────────────────
-      # When Kubernetes wants to stop this pod (update, scale down,
-      # node drain), it sends SIGTERM to the main process, then waits
-      # this many seconds before sending SIGKILL.
-      #
-      # PostgreSQL's shutdown sequence on SIGTERM (smart shutdown):
-      #   1. Rejects new connections
-      #   2. Waits for active queries to complete (up to 5 min by default)
-      #   3. Performs a checkpoint (flushes dirty pages from memory to disk)
-      #   4. Exits cleanly
-      #
-      # 60 seconds is conservative — enough for PostgreSQL to finish
-      # in-flight queries and flush data to the PVC safely.
-      # If the PG workload is heavy, consider increasing to 120s.
       terminationGracePeriodSeconds: 60
-
-      # ── Pod-Level Security Context ────────────────────────────
-      # securityContext at the pod level applies to ALL containers.
-      # It also controls how mounted volumes are owned.
       securityContext:
-        # fsGroup: the GID (group ID) assigned to all mounted volumes.
-        # The PostgreSQL process runs as UID/GID 999 inside the image.
-        # Setting fsGroup=999 ensures that when Kubernetes mounts the
-        # PVC at /var/lib/postgresql/data, the mounted directory is
-        # owned by group 999. This lets the postgres process read and
-        # write its data directory without needing root privileges.
-        #
-        # Without this:
-        #   The volume is mounted as root-owned → postgres (UID 999)
-        #   cannot write → PostgreSQL fails to start with a permissions error.
-        fsGroup: 999   # GID of the 'postgres' system user inside the postgres image
+        fsGroup: 999
 
-      # ── Anti-Affinity ─────────────────────────────────────────
-      # Affinity rules guide the scheduler on WHERE to place pods.
-      # podAntiAffinity says: "try to put me on a different node
-      # from other pods with the same labels."
-      #
-      # For a single replica this is a no-op (there's only one postgres pod).
-      # But when you scale to 2+ replicas for HA, this ensures postgres-0
-      # and postgres-1 land on different physical nodes. That way, a node
-      # failure takes down at most ONE postgres instance, not both.
-      #
-      # preferredDuringSchedulingIgnoredDuringExecution = "soft" preference:
-      #   The scheduler TRIES to honor this but doesn't fail if it can't
-      #   (e.g., your cluster only has 1 node). Use "required" for hard rules.
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100   # Weight 100 = maximum preference (range: 1-100)
+            - weight: 100
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    app: postgres   # Avoid nodes that already have a postgres pod
+                    app: postgres
                 topologyKey: kubernetes.io/hostname
-                # topologyKey defines what "different" means.
-                # kubernetes.io/hostname = different Kubernetes node (different Droplet).
-                # Alternatives: topology.kubernetes.io/zone (different AZ)
 
-      # ── Containers ────────────────────────────────────────────
       containers:
         - name: postgres
-          # Official PostgreSQL 15 image from Docker Hub.
-          # Pin to a minor version in production for reproducibility:
-          # image: postgres:15.6  (instead of postgres:15 which floats)
           image: postgres:15
-          imagePullPolicy: IfNotPresent   # Pull only if not already cached on the node
+          imagePullPolicy: IfNotPresent
 
-          # ── Container Security Context ───────────────────────
-          # Applies to this container only (overrides pod-level for this container).
           securityContext:
-            runAsUser: 999        # Run the process as UID 999 (the 'postgres' user).
-                                   # PostgreSQL explicitly refuses to run as UID 0 (root).
-                                   # This is a safety feature in the postgres image.
-            runAsNonRoot: true    # Kubernetes also enforces this — fail if image tries root.
+            runAsUser: 999
+            runAsNonRoot: true
             allowPrivilegeEscalation: false
-            # allowPrivilegeEscalation: false prevents the process from gaining more
-            # privileges than it started with (no sudo, no setuid binaries).
             readOnlyRootFilesystem: false
-            # Must be false because PostgreSQL writes to:
-            #   /tmp (temporary files during query execution)
-            #   /var/run/postgresql (Unix socket file)
-            # These are on the container's root filesystem (not the PVC).
 
-          # ── Ports ────────────────────────────────────────────
-          # Declaring ports here is INFORMATIONAL only.
-          # It documents what the container listens on for humans and
-          # tools (like port-forwarding). It does NOT open firewall rules —
-          # that is handled by Services and NetworkPolicies.
           ports:
-            - name: postgres         # Named port — NetworkPolicies can reference by name
-              containerPort: 5432   # PostgreSQL default port
+            - name: postgres
+              containerPort: 5432
               protocol: TCP
 
-          # ── Environment Variables ─────────────────────────────
-          # The official postgres image uses these env vars on FIRST START:
-          #   POSTGRES_USER     → creates this superuser
-          #   POSTGRES_PASSWORD → sets the superuser password
-          #   POSTGRES_DB       → creates this database
-          #   PGDATA            → where to store data files
-          #
-          # On subsequent starts (data already exists), these env vars
-          # are still read but the user/password/db creation is skipped.
           env:
-            # ── From Secret (sensitive values) ──────────────────
-            # secretKeyRef reads a specific key from a specific Secret.
-            # The value is decrypted from base64 at runtime.
-            # It is NOT exposed in `kubectl describe pod` output.
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -213,10 +81,6 @@ spec:
                   key: POSTGRES_PASSWORD
                   optional: false
 
-            # ── From ConfigMap (non-sensitive values) ──────────
-            # configMapKeyRef reads a specific key from a ConfigMap.
-            # ConfigMap values ARE visible in `kubectl describe pod`.
-            # Only use this for non-sensitive data.
             - name: POSTGRES_DB
               valueFrom:
                 configMapKeyRef:
@@ -224,71 +88,21 @@ spec:
                   key: POSTGRES_DB             # Key within the ConfigMap's data
                   optional: false
 
-            # PGDATA tells PostgreSQL where to store its data files.
-            # Using a subdirectory (/data/pgdata instead of /data) avoids
-            # a common "directory not empty" error on first start, because
-            # the K8s volume mount point may contain a "lost+found" directory
-            # created by the ext4 filesystem during formatting.
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
 
-          # ── Volume Mounts ─────────────────────────────────────
-          # Mount the PVC into the container at the PostgreSQL data path.
-          # The volume name "postgres-data" refers to the PVC created
-          # by volumeClaimTemplates below.
           volumeMounts:
-            - name: postgres-data                  # Must match volumeClaimTemplates[0].metadata.name
-              mountPath: /var/lib/postgresql/data  # Standard PostgreSQL data directory
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
 
-          # ── Resource Requests and Limits ──────────────────────
-          # requests = minimum guaranteed resources (used by the scheduler)
-          # limits   = maximum allowed resources (enforced by Linux cgroups)
-          #
-          # If a container exceeds its memory limit → OOMKilled (restarted).
-          # If a container exceeds its CPU limit   → throttled (slowed, not killed).
-          #
-          # PostgreSQL tuning advice:
-          #   shared_buffers (memory for caching data pages) defaults to 128MB.
-          #   Best practice: set to 25% of available RAM.
-          #   At 512Mi memory limit → shared_buffers should be ~128Mi.
-          #   For better performance, raise limits.memory to 1Gi+ and
-          #   set shared_buffers=256Mi via POSTGRES_INITDB_ARGS or postgresql.conf.
           resources:
             requests:
-              cpu: "250m"       # 0.25 vCPU — PostgreSQL uses little CPU at low load
-              memory: "256Mi"   # 256 MiB guaranteed (covers shared_buffers + overhead)
+              cpu: "250m"
+              memory: "256Mi"
             limits:
-              cpu: "500m"       # 0.5 vCPU max burst
-              memory: "512Mi"   # 512 MiB max — OOMKill if exceeded
+              cpu: "500m"
+              memory: "512Mi"
 
-          # ── Health Probes ─────────────────────────────────────
-          # Kubernetes has three probe types:
-          #
-          # ┌────────────────┬──────────────────────────────────────────────────┐
-          # │ Probe          │ Purpose                                          │
-          # ├────────────────┼──────────────────────────────────────────────────┤
-          # │ startupProbe   │ Is the app still initialising?                   │
-          # │                │ While failing: disable liveness+readiness probes. │
-          # │                │ Once succeeds: never runs again (liveness takes  │
-          # │                │ over). Failure → container restart.              │
-          # ├────────────────┼──────────────────────────────────────────────────┤
-          # │ livenessProbe  │ Is the container alive (not hung/deadlocked)?    │
-          # │                │ Failure → K8s restarts the container.            │
-          # │                │ Should check: "is the process responsive?"       │
-          # ├────────────────┼──────────────────────────────────────────────────┤
-          # │ readinessProbe │ Is the container ready to serve traffic NOW?     │
-          # │                │ Failure → pod removed from Service Endpoints     │
-          # │                │ (traffic stops, but container is NOT restarted). │
-          # │                │ Should check: "can I accept a request right now?"│
-          # └────────────────┴──────────────────────────────────────────────────┘
-          #
-          # For PostgreSQL: `pg_isready` connects to the socket and reports
-          # whether the server is accepting connections. It's the correct tool.
-
-          # startupProbe: Allow up to 5 minutes for PostgreSQL to initialise.
-          # On first start, PostgreSQL runs initdb (creates the cluster data files),
-          # which can take 20-60 seconds. On subsequent starts it's faster (~5s).
-          # failureThreshold × periodSeconds = 30 × 10 = 300 seconds = 5 minutes max.
           startupProbe:
             exec:
               command:
@@ -299,64 +113,38 @@ spec:
                 # -U reads from the environment variable POSTGRES_USER.
                 # -d specifies the database to connect to.
                 - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
-            initialDelaySeconds: 10   # Wait 10s before the first check (give initdb a head start)
-            periodSeconds: 10          # Check every 10 seconds
-            failureThreshold: 30       # Allow 30 consecutive failures before declaring startup failed
-            timeoutSeconds: 5          # Each probe attempt times out after 5 seconds
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 30
+            timeoutSeconds: 5
 
-          # livenessProbe: Restart if PostgreSQL stops responding.
-          # Kicks in after startupProbe succeeds.
-          # 3 failures × 20 seconds = 60 seconds of unresponsiveness before restart.
           livenessProbe:
             exec:
               command:
                 - /bin/sh
                 - -c
                 - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
-            initialDelaySeconds: 30   # Additional buffer after startup probe
-            periodSeconds: 20         # Check every 20 seconds (less aggressive than readiness)
-            failureThreshold: 3       # Restart after 3 consecutive failures (60s unresponsive)
-            successThreshold: 1       # Only 1 success needed to be "alive"
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+            successThreshold: 1
             timeoutSeconds: 5
 
-          # readinessProbe: Remove from Service if temporarily busy or unavailable.
-          # More aggressive than liveness (every 10s) so Django quickly routes away
-          # from a pod that's running a long VACUUM or checkpoint.
           readinessProbe:
             exec:
               command:
                 - /bin/sh
                 - -c
                 - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
-            initialDelaySeconds: 5    # Check quickly after startup probe passes
-            periodSeconds: 10         # Check every 10 seconds
-            failureThreshold: 3       # Remove from Service after 3 failures (30s)
-            successThreshold: 1       # 1 success to be considered ready again
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
             timeoutSeconds: 5
 
-  # ── Volume Claim Templates ────────────────────────────────────
-  # This is the key feature of StatefulSet over Deployment.
-  # volumeClaimTemplates tells the StatefulSet to automatically
-  # provision a NEW PVC for each replica pod.
-  #
-  # Pod postgres-0 gets PVC: postgres-data-postgres-0
-  # Pod postgres-1 gets PVC: postgres-data-postgres-1 (if replicas>1)
-  #
-  # This is different from referencing an existing PVC in `volumes:`.
-  # Each pod gets its OWN dedicated PVC — they do NOT share storage.
-  # This is correct for PostgreSQL (sharing storage = data corruption).
-  #
-  # LIFECYCLE WARNING:
-  # These PVCs are NOT deleted when the StatefulSet is deleted.
-  # This is intentional — Kubernetes protects your data.
-  # To delete them manually:
-  #   kubectl delete pvc postgres-data-postgres-0 -n caloriechecker-prod
-  # To delete them automatically on StatefulSet deletion:
-  #   Add persistentVolumeClaimRetentionPolicy: whenDeleted: Delete
-  #   (available in K8s 1.27+ as beta)
   volumeClaimTemplates:
     - metadata:
-        name: postgres-data   # PVC name will be: postgres-data-postgres-0
+        name: postgres-data
 
         labels:
           app: postgres
@@ -366,13 +154,11 @@ spec:
           description: "DigitalOcean SSD block storage for PostgreSQL data files"
 
       spec:
-        # These settings mirror the standalone PVC in storage/postgres-pvc.yaml.
-        # See that file for detailed explanations of each field.
         accessModes:
-          - ReadWriteOnce   # Block storage can only be attached to ONE node at a time
+          - ReadWriteOnce
 
-        storageClassName: do-block-storage   # DigitalOcean CSI driver provisions the volume
+        storageClassName: do-block-storage
 
         resources:
           requests:
-            storage: 5Gi   # 5 gibibytes of SSD block storage
+            storage: 5Gi

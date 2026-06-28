@@ -1,24 +1,3 @@
-# =============================================================================
-# CONFIGMAP: nginx-static-config
-# =============================================================================
-# Contains the nginx.conf used by the nginx-static sidecar in the backend
-# Deployment. The sidecar serves Django's collected static files on port 8080.
-#
-# Flow:
-#   1. collect-static init container: "manage.py collectstatic --noinput"
-#      Writes all static files to /app/staticfiles (the "static-files" emptyDir)
-#   2. nginx-static sidecar: mounts that same emptyDir at
-#      /usr/share/nginx/html/static and serves via this nginx.conf
-#   3. The Ingress routes /static/ → backend Service port 8080 → this sidecar
-#
-# Non-root nginx design (pod runs all containers as uid=1000):
-#   Standard nginx:alpine expects root because it writes to root-owned paths:
-#     /var/run/nginx.pid   → replaced by: pid /tmp/nginx.pid
-#     /var/log/nginx/      → replaced by: access_log /dev/stdout; error_log /dev/stderr
-#     /var/cache/nginx/    → replaced by: *_temp_path /tmp/nginx_*/
-#   Port 8080 needs no root (only ports < 1024 require root to bind).
-# =============================================================================
-
 apiVersion: v1
 kind: ConfigMap
 

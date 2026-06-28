@@ -1,85 +1,8 @@
-# ============================================================
-# Service — postgres (ClusterIP)
-# ============================================================
-# A Service is a stable network endpoint for one or more pods.
-# It solves a fundamental problem with pods: pod IP addresses
-# change every time a pod is restarted or rescheduled.
-#
-# Without a Service:
-#   Django config: POSTGRES_HOST=10.244.0.8 (pod IP)
-#   After pod restart: postgres-0 moves to 10.244.1.3
-#   Django still tries 10.244.0.8 → connection refused
-#   → Your app is broken until you manually update the config
-#
-# With a Service:
-#   Django config: POSTGRES_HOST=postgres (Service name)
-#   Service ClusterIP: 10.96.45.123 (stable, never changes)
-#   kube-proxy routes: 10.96.45.123:5432 → pod IP:5432
-#   After pod restart: kube-proxy automatically updates routing
-#   Django still uses "postgres" → DNS resolves to 10.96.45.123
-#   → Works seamlessly, zero config changes needed
-#
-# ── Service Types ─────────────────────────────────────────────
-#
-# ClusterIP (our choice):
-#   • Assigns a virtual IP only reachable from WITHIN the cluster
-#   • No external access possible (cannot be reached from internet)
-#   • Perfect for internal services like databases
-#   • This is the DEFAULT type if you omit spec.type
-#
-# NodePort:
-#   • Opens a port (30000-32767) on EVERY node's public IP
-#   • External access via: <any-node-IP>:<nodePort>
-#   • Not recommended for databases (security risk, awkward URLs)
-#   • Useful for quick demos or bare-metal without a load balancer
-#
-# LoadBalancer:
-#   • Provisions a DigitalOcean Load Balancer (cloud resource, costs ~$12/mo)
-#   • Assigns a public IP accessible from the internet
-#   • Used for the frontend/ingress controller, NOT databases
-#   • Never use LoadBalancer for PostgreSQL — exposes DB to internet
-#
-# ExternalName:
-#   • Creates a DNS CNAME pointing to an external hostname
-#   • Used to map a Kubernetes Service name to an external managed DB
-#   • Example: map "postgres" to "mydb.xxx.us-east-1.rds.amazonaws.com"
-#
-# ── How DNS works for this Service ────────────────────────────
-# When you create a Service named "postgres" in namespace
-# "caloriechecker-prod", CoreDNS automatically creates these records:
-#
-# Short (same namespace):           postgres
-# Namespace-qualified:              postgres.caloriechecker-prod
-# Full FQDN (any namespace):        postgres.caloriechecker-prod.svc.cluster.local
-#
-# Django's settings.py has POSTGRES_HOST=postgres (from ConfigMap).
-# Within caloriechecker-prod, "postgres" resolves correctly.
-# From another namespace, you'd need "postgres.caloriechecker-prod".
-#
-# ── How traffic flows ─────────────────────────────────────────
-# Django pod                    postgres pod
-#   │                                │
-#   │ 1. connect("postgres:5432")    │
-#   │    DNS lookup: "postgres"      │
-#   │    → 10.96.45.123 (ClusterIP) │
-#   │                                │
-#   │ 2. TCP SYN to 10.96.45.123:5432│
-#   │    iptables rule (kube-proxy): │
-#   │    DNAT to 10.244.0.8:5432    │
-#   │    (the actual postgres pod IP)│
-#   │                                │
-#   └────────────────────────────────►
-#                             3. TCP connection established
-#                                SQL queries flow normally
-# ============================================================
-
 apiVersion: v1
-kind: Service   # Services are in the core (v1) API group
+kind: Service
 
 metadata:
-  name: postgres              # ← This exact name becomes the DNS hostname!
-                               # Django uses: POSTGRES_HOST=postgres
-                               # This resolves to this Service's ClusterIP.
+  name: postgres
   namespace: caloriechecker-prod
 
   labels:
@@ -89,60 +12,16 @@ metadata:
 
   annotations:
     description: "ClusterIP Service for PostgreSQL 15. Internal cluster access only — not reachable from outside. Django connects via POSTGRES_HOST=postgres."
-    # Useful kubectl commands:
-    # Check the service:     kubectl get svc postgres -n caloriechecker-prod
-    # Test connectivity:     kubectl exec -it <backend-pod> -- nc -zv postgres 5432
-    # Check endpoints:       kubectl get endpoints postgres -n caloriechecker-prod
-    # Port-forward locally:  kubectl port-forward svc/postgres 5432:5432 -n caloriechecker-prod
-    #                        Then: psql -h localhost -U postgres -d caloriechecker
 
 spec:
-  # ── Service Type ──────────────────────────────────────────────
-  # ClusterIP: assigns an internal-only virtual IP address.
-  # The postgres database should NEVER be accessible from outside
-  # the cluster — keeping it ClusterIP enforces this.
-  #
-  # If you ever need to connect from your local machine for debugging,
-  # use kubectl port-forward (see annotation above) — it creates an
-  # encrypted tunnel without exposing the service externally.
   type: ClusterIP
 
-  # ── Pod Selector ─────────────────────────────────────────────
-  # The Service uses this selector to find the pods to forward
-  # traffic to. Kubernetes continuously watches pods with these labels
-  # and keeps the Endpoints list up to date.
-  #
-  # When postgres-0 is healthy:
-  #   Endpoints: [10.244.0.8:5432]
-  # When postgres-0 is restarting:
-  #   Endpoints: []  (traffic is queued or fails until pod is ready)
-  # When postgres-0 comes back:
-  #   Endpoints: [10.244.1.3:5432]  (new IP, but Service ClusterIP is unchanged)
-  #
-  # Readiness probe determines when a pod is added to Endpoints.
-  # If a pod fails its readiness probe, it's removed from Endpoints
-  # until it passes again. This prevents traffic from going to
-  # an initialising or unhealthy postgres pod.
   selector:
-    app: postgres   # Matches the labels on postgres StatefulSet pods
+    app: postgres
 
-  # ── Port Mapping ─────────────────────────────────────────────
   ports:
-    - name: postgres     # Optional but recommended — allows NetworkPolicies
-                          # and Ingress rules to reference port by name instead
-                          # of hardcoded number. Name must be lowercase alpha+hyphen.
+    - name: postgres
       protocol: TCP
-      port: 5432         # The port this SERVICE listens on.
-                          # This is what clients (Django) connect to.
-                          # The ClusterIP:5432 address.
+      port: 5432
 
-      targetPort: 5432   # The port on the POD to forward to.
-                          # This is what PostgreSQL inside the container listens on.
-                          # port and targetPort are the same here (both 5432).
-                          #
-                          # Example where they differ:
-                          #   port: 80 (Service listens on 80)
-                          #   targetPort: 8080 (app runs on 8080, can't bind to <1024 without root)
-                          #
-                          # You can also use a named port:
-                          #   targetPort: postgres  (references the containerPort name in the StatefulSet)
+      targetPort: 5432   

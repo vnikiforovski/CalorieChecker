@@ -1,281 +1,58 @@
-# =============================================================================
-# PREREQUISITE: Install the NGINX Ingress Controller first!
-# =============================================================================
-# Before applying this file, you MUST install the nginx-ingress-controller.
-# See the file: k8s/ingress/install-nginx-ingress.md for exact commands.
-#
-# Without the controller, this Ingress resource will be created but ignored —
-# no traffic routing will happen and no external IP will be assigned.
-# =============================================================================
-
-# =============================================================================
-# KUBERNETES INGRESS: CalorieChecker Application
-# =============================================================================
-# What is an Ingress?
-#   An Ingress is a Kubernetes resource that defines HTTP/HTTPS routing rules.
-#   It tells the Ingress Controller "when a request comes in for path X,
-#   route it to Service Y on port Z."
-#
-# What is an Ingress CONTROLLER?
-#   The Ingress resource is just a configuration file — it does nothing by itself.
-#   The Ingress Controller is the actual software that reads these rules and
-#   implements them. We use the nginx-ingress-controller (the most popular).
-#
-#   Think of it like this:
-#   - Ingress = a routing rulebook (YAML file)
-#   - Ingress Controller = the router that reads and enforces the rulebook
-#
-# How does traffic actually flow from the internet to our pods?
-#
-#   ┌─────────────────────────────────────────────────────────────────────┐
-#   │                     TRAFFIC FLOW DIAGRAM                           │
-#   │                                                                     │
-#   │  User's Browser                                                     │
-#   │       │                                                             │
-#   │       │ HTTP request to IP or domain                                │
-#   │       ▼                                                             │
-#   │  DigitalOcean Load Balancer  (external IP, e.g. 143.198.x.x)       │
-#   │  [Type: LoadBalancer Service for nginx-ingress-controller]          │
-#   │  - Created automatically when you install nginx-ingress             │
-#   │  - Costs ~$12/month on DigitalOcean                                │
-#   │  - Listens on ports 80 (HTTP) and 443 (HTTPS)                      │
-#   │       │                                                             │
-#   │       │ Forwards all TCP traffic                                    │
-#   │       ▼                                                             │
-#   │  nginx-ingress-controller Pod  (inside the cluster)                 │
-#   │  [Runs Nginx as a reverse proxy]                                    │
-#   │  - Reads all Ingress resources in the cluster                       │
-#   │  - Builds Nginx config from the routing rules                       │
-#   │  - Routes based on Host header and URL path                         │
-#   │       │                                                             │
-#   │       ├─── path: /api/  ──────────────────────────────────────┐    │
-#   │       │                                                         │    │
-#   │       ├─── path: /admin/ ───────────────────────────────────┐  │    │
-#   │       │                                                      │  │    │
-#   │       └─── path: /      ──────────────────────────────┐     │  │    │
-#   │                                                        │     │  │    │
-#   │                                                        ▼     ▼  ▼   │
-#   │  Kubernetes Services:                            frontend  backend  │
-#   │  (ClusterIP, internal only)                      :80       :8000    │
-#   │                                                   │          │      │
-#   │                                                   ▼          ▼      │
-#   │  Pods:                                     [Nginx pods]  [Django]   │
-#   │                                            pod1, pod2   pod1, pod2  │
-#   └─────────────────────────────────────────────────────────────────────┘
-#
-# How to get the external IP after applying:
-#   After installing nginx-ingress, run:
-#     kubectl get svc -n ingress-nginx
-#   Look for the service named "ingress-nginx-controller" with TYPE=LoadBalancer.
-#   The EXTERNAL-IP column shows your public IP (may take 1-2 minutes to appear).
-#
-#   Once you have the IP:
-#   - Visit http://<EXTERNAL-IP>/ → React frontend
-#   - Visit http://<EXTERNAL-IP>/api/ → Django REST API
-#   - Visit http://<EXTERNAL-IP>/admin/ → Django admin panel
-#
-#   For a real domain (e.g., caloriechecker.com):
-#   - Point your domain's A record to this external IP in your DNS settings
-#   - Add TLS with cert-manager (see install-nginx-ingress.md for hints)
-# =============================================================================
-
-apiVersion: networking.k8s.io/v1   # Networking API group for Ingress resources
+apiVersion: networking.k8s.io/v1
 kind: Ingress
 
 metadata:
   name: caloriechecker-ingress
   namespace: caloriechecker-prod
-  # The Ingress must be in the same namespace as the Services it references.
-  # The nginx-ingress-controller (in ingress-nginx namespace) watches ALL namespaces.
 
   labels:
     app: caloriechecker
     environment: production
 
-  # ===========================================================================
-  # ANNOTATIONS: Configure nginx-ingress-controller behavior
-  # ===========================================================================
-  # Annotations on an Ingress resource are read by the Ingress Controller
-  # and translated into Nginx configuration directives.
-  # Different controllers (Traefik, HAProxy, etc.) use different annotation keys.
-  # We use the standard nginx.ingress.kubernetes.io/* prefix.
   annotations:
 
     nginx.ingress.kubernetes.io/proxy-body-size: "10m"
-    # Maximum size of the request body that Nginx will accept.
-    # Default is 1MB. We set 10MB to allow uploading food photos.
-    # If a user uploads an image larger than 10MB, they get a 413 error.
-    # Django also has its own limit (DATA_UPLOAD_MAX_MEMORY_SIZE in settings.py).
-    # The more restrictive of the two takes effect — Nginx rejects at the edge
-    # before the request even reaches Django, saving Django resources.
 
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
-    # How long (in seconds) Nginx waits for a response from the backend pod
-    # before giving up and returning a 504 Gateway Timeout to the user.
-    # 300 seconds = 5 minutes.
-    # Why 5 minutes? Our AI-powered calorie analysis (calling Anthropic API)
-    # can take several seconds. Regular API calls are fast (<1s).
-    # The generous timeout handles slow AI responses without timing out.
-    # Default is 60 seconds.
 
     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
-    # How long Nginx waits to SEND data to the backend.
-    # (How long for the backend to accept the request body.)
-    # Set to match proxy-read-timeout for consistency.
-    # Relevant for large file uploads — gives Django time to receive the full file.
-
-    # NOTE: rewrite-target is intentionally omitted.
-    # Django's URL conf includes the /api/ prefix (confirmed by health probe path
-    # /api/health/ hitting Django directly on port 8000). Stripping /api/ via
-    # rewrite-target: /$2 would cause Django to return 404 for all API requests.
 
 spec:
   ingressClassName: nginx
-  # Tells Kubernetes WHICH Ingress Controller should handle this Ingress.
-  # "nginx" refers to the nginx-ingress-controller we installed.
-  # Multiple controllers can coexist (e.g., nginx for HTTP, cert-manager for TLS).
-  # Without this, all controllers would compete to handle the Ingress — chaos.
-  #
-  # Before Kubernetes 1.18, this was set via annotation:
-  # kubernetes.io/ingress.class: nginx
-  # The ingressClassName field is the modern approach (Kubernetes 1.18+).
-
-  # ===========================================================================
-  # TLS (HTTPS) — commented out until you have a domain and cert-manager
-  # ===========================================================================
-  # tls:
-  #   - hosts:
-  #       - caloriechecker.com
-  #       - www.caloriechecker.com
-  #     secretName: caloriechecker-tls
-  #     # "caloriechecker-tls" is a Secret containing the TLS certificate and key.
-  #     # cert-manager (a Kubernetes add-on) creates and renews this Secret
-  #     # automatically using Let's Encrypt (free SSL certificates).
-  #     # Install cert-manager: https://cert-manager.io/docs/installation/
-  #
-  # To enable TLS:
-  #   1. Install cert-manager
-  #   2. Create a ClusterIssuer (ACME/Let's Encrypt)
-  #   3. Add the "cert-manager.io/cluster-issuer: letsencrypt-prod" annotation
-  #   4. Uncomment the tls section above with your real domain
-  #   5. Add "nginx.ingress.kubernetes.io/ssl-redirect: 'true'" to auto-redirect HTTP→HTTPS
-
-  # ===========================================================================
-  # ROUTING RULES
-  # ===========================================================================
   rules:
-    - # No "host:" field = match ANY hostname (or direct IP access).
-      # This works for development and when using an IP address.
-      # In production, add: host: caloriechecker.com
-      # Then Nginx will ONLY route requests with Host: caloriechecker.com header.
-      # Requests to the raw IP won't match and get a 404.
-
+    -
       http:
         paths:
-          # ===================================================================
-          # RULE 1: API paths → Django backend
-          # ===================================================================
           - path: /api/
-            # Match /api/ and all sub-paths. Django receives the full /api/...
-            # URL unchanged — no rewriting. Django's own URL conf handles routing.
-            #
-            # Examples:
-            #   /api/foods/      → Django receives /api/foods/
-            #   /api/health/     → Django receives /api/health/
-            #   /api/auth/login/ → Django receives /api/auth/login/
-
             pathType: Prefix
-
             backend:
               service:
                 name: backend
-                # Route to the "backend" ClusterIP Service (k8s/backend/service.yaml)
                 port:
                   number: 8000
-                  # The Service's port 8000 → forwards to Django on pod port 8000
 
-          # ===================================================================
-          # RULE 2: Django Admin → backend (no URL rewriting)
-          # ===================================================================
           - path: /admin/
-            # Match /admin/ and all sub-paths (/admin/login/, /admin/foods/, etc.)
-            # Django's admin app is hardcoded to live at /admin/ URL path.
-            # Django receives the full /admin/... URL — no rewriting needed.
-
             pathType: Prefix
-            # Prefix matching: any request starting with /admin/ matches.
-            # /admin/         → backend receives /admin/
-            # /admin/login/   → backend receives /admin/login/
-            # /admin/app/model/ → backend receives /admin/app/model/
-            #
-            # IMPORTANT: This rule must come BEFORE the "/" catch-all below,
-            # but Kubernetes Ingress evaluates longer/more-specific paths first,
-            # so the order here doesn't strictly matter for Prefix paths.
-            # For regex paths, ORDER MATTERS — first match wins.
-
             backend:
               service:
                 name: backend
                 port:
                   number: 8000
 
-          # ===================================================================
-          # RULE 3: Django static files → nginx-static sidecar on backend pod
-          # ===================================================================
           - path: /static/
-            # Django's collectstatic writes files to STATIC_ROOT (/app/staticfiles).
-            # The nginx-static sidecar mounts that directory and serves it on port 8080.
-            # All Django static assets (admin CSS/JS, DRF browseable API, app statics)
-            # live under /static/ — this rule forwards those requests directly to nginx,
-            # bypassing Gunicorn entirely. nginx is ~10× faster than Gunicorn at serving
-            # pre-built files.
-            #
-            # How requests are resolved:
-            #   /static/admin/css/base.css
-            #     → backend Service port 8080
-            #     → nginx-static container (port 8080)
-            #     → file /usr/share/nginx/html/static/admin/css/base.css
-            #        (from the "static-files" emptyDir volume)
-            #
-            # URL is passed unchanged to nginx — nginx's "root" directive handles mapping.
-
             pathType: Prefix
 
             backend:
               service:
                 name: backend
-                # The SAME backend Service, but on port 8080 (the nginx-static sidecar).
-                # Service selector "app: backend" routes to backend pods, which contain
-                # both the gunicorn container (port 8000) and nginx-static (port 8080).
                 port:
                   number: 8080
 
-          # ===================================================================
-          # RULE 4: Everything else → React frontend
-          # ===================================================================
           - path: /
-            # The catch-all: match any request not matched by the rules above.
-            # This routes /, /login, /dashboard, /foods, etc. to the React SPA.
-            #
-            # React is a Single Page Application (SPA):
-            #   - All routes (/, /login, /foods/123) return the SAME index.html
-            #   - React Router (in JavaScript) handles URL routing client-side
-            #   - Nginx serves index.html for any path not matching a static file
-            #   - This is configured in our nginx.conf inside the Docker image:
-            #     try_files $uri $uri/ /index.html;
-            #   That line makes Nginx fall back to index.html if the file doesn't
-            #   exist — essential for React Router to work correctly.
-
             pathType: Prefix
-            # Prefix matching with "/" matches EVERYTHING.
-            # This is the default catch-all route.
-            # It's evaluated LAST because more specific rules take priority.
-            # (In nginx-ingress: longer prefix wins; /api/ wins over / for /api/... requests)
 
             backend:
               service:
                 name: frontend
-                # Route to the "frontend" ClusterIP Service (k8s/frontend/service.yaml)
                 port:
                   number: 80
-                  # The Service's port 80 → forwards to Nginx on pod port 80

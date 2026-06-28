@@ -1,32 +1,3 @@
-# =============================================================================
-# KUBERNETES DEPLOYMENT: React Frontend (served by Nginx)
-# =============================================================================
-# What does this Deployment run?
-#   Our React/Vite app is a static website — it compiles to plain HTML, CSS,
-#   and JavaScript files. These static files are served by Nginx, a high-performance
-#   web server, inside the Docker container.
-#
-# Architecture:
-#   Browser → Ingress (nginx-ingress-controller) → frontend Service → frontend Pod
-#                                                          ↓ (for /api/ paths)
-#                                                   backend Service → backend Pod
-#
-# Why Nginx for serving React?
-#   - Nginx is extremely efficient at serving static files (thousands of req/s)
-#   - Built-in gzip compression, caching headers, SPA routing support
-#   - Much lighter than running a Node.js dev server in production
-#   - Our Dockerfile runs `npm run build` and copies the output to Nginx's
-#     web root (/usr/share/nginx/html/)
-#
-# Key difference from the backend Deployment:
-#   - No init container (frontend doesn't need to wait for PostgreSQL)
-#   - No environment variables (the JS is pre-compiled; runtime config is in the JS bundle)
-#   - No secrets needed (no API keys in the frontend pod)
-#   - Lighter resources (Nginx serving static files is very efficient)
-#   - runAsNonRoot: false (Nginx needs to bind to port 80, which requires root
-#     for initial setup, though it drops privileges for worker processes)
-# =============================================================================
-
 apiVersion: apps/v1
 kind: Deployment
 
@@ -45,26 +16,15 @@ metadata:
 
 spec:
   replicas: 2
-  # 2 replicas for the same reasons as the backend:
-  #   - High availability: 1 node down → other pod still serves the UI
-  #   - Load distribution: both pods share incoming web traffic
-  # Frontend pods are stateless (just serving static files), so scaling is trivial.
-
   selector:
     matchLabels:
       app: frontend
-  # The Deployment manages all pods with label "app: frontend".
 
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
-      # Allow 1 extra pod during rolling update.
-      # Temporarily: 2 old + 1 new = 3 pods during the transition.
-
       maxUnavailable: 0
-      # No old pods die until a new pod is confirmed healthy.
-      # Zero-downtime frontend updates — users never see a "connection refused".
 
   template:
     metadata:
@@ -75,15 +35,6 @@ spec:
 
     spec:
       terminationGracePeriodSeconds: 15
-      # Frontend pods shut down faster than backend (15s vs 30s) because:
-      #   - Nginx handles graceful shutdown very quickly
-      #   - No database transactions to complete
-      #   - Static file serving requests complete in milliseconds
-      # The preStop hook below adds 3 seconds before SIGTERM.
-
-      # =========================================================================
-      # POD ANTI-AFFINITY: Spread frontend pods across different nodes
-      # =========================================================================
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -92,109 +43,50 @@ spec:
                 labelSelector:
                   matchLabels:
                     app: frontend
-                  # Find other "app: frontend" pods and avoid their nodes.
                 topologyKey: kubernetes.io/hostname
-                # "hostname" topology = one pod per physical node (preferred).
-                # With 2 nodes and 2 replicas, this places one pod on each node.
-                # If node-1 fails: frontend pod-1 dies, but pod-2 on node-2 keeps serving.
 
       containers:
         - name: frontend
           image: vnikiforovski0604/caloriechecker-frontend:latest
           imagePullPolicy: Always
-          # Always pull "latest" to ensure we run the newest React build.
 
           ports:
             - name: http
               containerPort: 80
-              # Nginx listens on port 80 inside the container.
-              # Port 80 is the standard HTTP port.
-              # Note: We don't need SSL/TLS here because TLS termination
-              # happens at the Ingress Controller (outside this pod).
-              # Traffic inside the cluster travels over the private network.
 
-          # =========================================================================
-          # RESOURCE REQUESTS AND LIMITS (lighter than backend)
-          # =========================================================================
           resources:
             requests:
               cpu: 100m
-              # Nginx serving static files is very CPU-light: ~100m is generous.
-              # Compare to backend's 250m — Django does a lot more computation.
-
               memory: 128Mi
-              # Nginx uses ~10-30MB for worker processes + static file caching.
-              # 128Mi gives plenty of headroom.
 
             limits:
               cpu: 200m
-              # Even under heavy load, Nginx shouldn't need more than 200m.
-              # CPU-intensive work happens client-side (in the browser), not here.
-
               memory: 256Mi
-              # 2x the request, consistent with backend ratio.
-              # More than enough for Nginx + buffered file content.
 
-          # =========================================================================
-          # LIFECYCLE HOOKS
-          # =========================================================================
           lifecycle:
             preStop:
               exec:
                 command: ["sh", "-c", "sleep 3"]
-              # 3 second sleep (vs backend's 5 seconds) before SIGTERM.
-              # Gives the Ingress/load balancer time to stop routing traffic here.
-              # Shorter than backend because there are no long-running requests
-              # (static files are served in milliseconds, not seconds).
 
-          # =========================================================================
-          # SECURITY CONTEXT (container-level)
-          # =========================================================================
           securityContext:
             allowPrivilegeEscalation: false
-            # Even though Nginx starts as root (to bind port 80),
-            # we prevent it from acquiring additional privileges.
-            # Nginx's master process binds the port, then worker processes
-            # drop privileges to a non-root user (www-data, uid=82).
-
-            # Note: We intentionally do NOT set runAsNonRoot: true here
-            # because the pod-level spec.securityContext is also omitted.
-            # Nginx's master process needs to run as root to bind port 80.
-            # In a more hardened setup, you'd use a non-privileged port (8080)
-            # and set runAsNonRoot: true + runAsUser: 101 (nginx user in Alpine).
-
             readOnlyRootFilesystem: false
-            # Nginx needs to write:
-            #   - /tmp/ for temporary files
-            #   - /var/cache/nginx/ for proxy cache
-            #   - /var/run/nginx.pid for the process ID file
-            # These could be mounted as writable tmpfs volumes in a hardened setup.
 
-          # =========================================================================
-          # HEALTH PROBES
-          # =========================================================================
           startupProbe:
             httpGet:
               path: /
               port: 80
-              # GET http://pod-ip:80/ — Nginx should immediately return 200
-              # with our React app's index.html.
+
             failureThreshold: 15
             periodSeconds: 10
-            # Allow up to 150 seconds (15 × 10s) for Nginx to start.
-            # Nginx starts very fast (< 1 second), but we're generous for
-            # slow image pulls on node cold starts.
 
           livenessProbe:
             httpGet:
               path: /
               port: 80
             initialDelaySeconds: 0
-            # Start immediately after startupProbe succeeds.
             periodSeconds: 20
             failureThreshold: 3
-            # If Nginx fails to respond 3 times (60 seconds), restart the container.
-            # This catches cases where Nginx process died or is deadlocked.
 
           readinessProbe:
             httpGet:
@@ -203,6 +95,3 @@ spec:
             initialDelaySeconds: 0
             periodSeconds: 10
             failureThreshold: 3
-            # If 3 consecutive checks fail, remove from Service endpoints.
-            # Traffic stops going to this pod until it recovers.
-            # For Nginx, failure usually means the process crashed — very rare.

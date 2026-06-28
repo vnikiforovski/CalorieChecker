@@ -1,28 +1,3 @@
-# =============================================================================
-# POD DISRUPTION BUDGET (PDB): Frontend
-# =============================================================================
-# Same concept as the backend PDB — prevents all frontend pods from being
-# evicted simultaneously during voluntary disruptions (node maintenance, etc.).
-#
-# Why do we need a separate PDB for the frontend?
-#   PDBs are selector-based — each PDB only protects pods matching its selector.
-#   The backend PDB protects pods with "app: backend".
-#   This PDB protects pods with "app: frontend".
-#   You need one PDB per logical group of pods you want to protect.
-#
-# Frontend-specific considerations:
-#   The frontend is the user's entry point to the app. If both frontend pods
-#   are evicted during node maintenance and they take 30 seconds to restart,
-#   users will see connection errors for 30 seconds — not great.
-#   This PDB ensures at least 1 frontend pod always serves the React app.
-#
-# Important: PDB protects against voluntary disruptions ONLY.
-#   If both nodes simultaneously crash (power outage at the data center),
-#   both frontend pods die regardless of PDB. That's why we also have:
-#   - 2 replicas across 2 nodes (pod anti-affinity)
-#   - Kubernetes self-healing (pods restart on the surviving node)
-# =============================================================================
-
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 
@@ -36,18 +11,7 @@ metadata:
 
 spec:
   minAvailable: 1
-  # Always keep at least 1 frontend pod running during maintenance.
-  #
-  # With replicas=2:
-  #   - Node drain of node-1: pod on node-1 is evicted → replacement starts on node-2
-  #     (now node-2 has 2 frontend pods temporarily) → node drain completes
-  #   - Total downtime: 0 seconds (the existing pod on node-2 keeps serving traffic)
-  #
-  # This is the same setting as backend-pdb and reflects the same reasoning:
-  # we have 2 replicas and want at most 1 to be disrupted at a time.
 
   selector:
     matchLabels:
       app: frontend
-    # Protect pods with label "app: frontend".
-    # Must match the Deployment's pod template labels.

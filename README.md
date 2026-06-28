@@ -123,7 +123,7 @@ The project uses a **GitFlow**-based GitHub Actions setup with three pipelines:
 |--------|----------|------|
 | `feature/*` | `feature.yml` | Lint (Python only) — fast feedback < 1 min |
 | `develop` | `ci.yml` | Lint → Test → Build → Security scan |
-| `master` | `cd.yml` | Test → Build & push → Security scan → Release (on tag) |
+| `master` / `release/*` / `hotfix/*` | `cd.yml` | Test → Build & push → Security scan → K8s Deploy → Release (on tag) |
 
 ### DockerHub Images
 
@@ -155,6 +155,8 @@ Add these in **Settings → Secrets and variables → Actions**:
 |--------|-------------|
 | `DOCKERHUB_USERNAME` | Your DockerHub username |
 | `DOCKERHUB_TOKEN` | DockerHub access token (not your password) |
+| `DIGITALOCEAN_ACCESS_TOKEN` | DigitalOcean personal access token (for K8s deploy) |
+| `K8S_CLUSTER_NAME` | Name of your DigitalOcean K8s cluster (e.g. `caloriechecker-cluster`) |
 
 ## API Endpoints
 

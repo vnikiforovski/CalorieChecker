@@ -1,186 +1,42 @@
-# ============================================================
-# Production Namespace — caloriechecker-prod
-# ============================================================
-# A Namespace in Kubernetes is a virtual cluster within a
-# physical cluster. It provides a way to divide cluster
-# resources between multiple users, teams, or environments.
-#
-# Resources in different namespaces are isolated by default:
-#   • RBAC permissions are scoped per namespace
-#   • ResourceQuotas limit resource usage per namespace
-#   • Services can still reach other namespaces via FQDN:
-#     postgres.caloriechecker-prod.svc.cluster.local
-#
-# We use three namespaces:
-#   caloriechecker-prod        → live production traffic
-#   caloriechecker-staging     → pre-production testing
-#   caloriechecker-monitoring  → Prometheus, Grafana, alerting
-#
-# Benefits of this separation:
-#   • prod can never starve staging (quotas are per namespace)
-#   • developers get staging access without touching prod
-#   • `kubectl delete namespace caloriechecker-staging` cleanly
-#     removes ALL staging resources at once
-#   • Kubernetes dashboards and kubectl output stay organised
-# ============================================================
-
-apiVersion: v1      # Namespaces are in the core API group (v1 = stable)
-kind: Namespace     # The Kubernetes resource type we are declaring
+apiVersion: v1
+kind: Namespace
 
 metadata:
-  # The unique identifier for this namespace.
-  # Naming convention: <project>-<environment>
-  # Rules: lowercase, alphanumeric, hyphens only, max 63 chars.
   name: caloriechecker-prod
 
-  # ── Labels ──────────────────────────────────────────────────
-  # Labels are arbitrary key-value pairs attached to any K8s object.
-  # They are INDEXED and used for:
-  #   • Selecting groups of objects: kubectl get pods -l app=backend
-  #   • Targeting with NetworkPolicies, ResourceQuotas, etc.
-  #   • Filtering in monitoring dashboards (Grafana, Lens)
-  #   • CI/CD pipeline selectors
-  #
-  # Label keys can optionally have a prefix: prefix/name
-  # Without a prefix (our labels), they are "user-defined".
   labels:
-    environment: production   # Which tier: production, staging, monitoring
-    project: caloriechecker   # Groups all namespaces of this project together.
-                               # Useful when one cluster hosts multiple projects.
-    managed-by: kubectl       # How this resource is managed.
-                               # Alternatives: helm, terraform, argocd.
-                               # Helps ops know how to update/delete safely.
+    environment: production
+    project: caloriechecker
+    managed-by: kubectl
 
-  # ── Annotations ─────────────────────────────────────────────
-  # Annotations are also key-value pairs but NOT indexed.
-  # They cannot be used in selectors. They store descriptive
-  # metadata for humans and external tooling (e.g., CI systems,
-  # documentation generators, cost tracking tools).
-  # Values can be long strings, JSON, or URLs.
   annotations:
     description: "Production namespace for CalorieChecker (Django + React + PostgreSQL)"
     owner: "viktor@caloriechecker.com"
     created-by: "kubectl apply"
-    # kubernetes.io/change-cause is shown in `kubectl rollout history`
     kubernetes.io/change-cause: "Initial namespace creation"
 
 ---
-# ============================================================
-# ResourceQuota — prod-quota
-# ============================================================
-# A ResourceQuota enforces hard limits on the total resources
-# consumable within this namespace.
-#
-# Without quotas, one namespace can consume ALL cluster resources
-# and starve other namespaces. For example, a runaway Deployment
-# that scales to 1000 replicas would take down your entire cluster.
-#
-# Two categories of limits:
-#   Compute: CPU and memory (requests and limits separately)
-#   Object count: pods, PVCs, Services, Secrets, ConfigMaps
-#
-# How compute quotas work:
-#   When you set BOTH requests.cpu and limits.cpu quotas,
-#   EVERY container must specify both requests AND limits.
-#   This prevents unbounded containers from bypassing the quota.
-#   (The LimitRange below sets defaults so devs don't forget.)
-#
-# CPU units:
-#   "1" = 1 vCPU (core)
-#   "250m" = 250 millicores = 0.25 vCPU
-#   "4" = 4 vCPU cores
-#
-# Memory units:
-#   "Ki" = kibibytes (1 Ki = 1,024 bytes)
-#   "Mi" = mebibytes (1 Mi = 1,048,576 bytes)
-#   "Gi" = gibibytes (1 Gi = 1,073,741,824 bytes)
-#   Note: Use "Mi"/"Gi" not "MB"/"GB" — they differ by about 5%.
-# ============================================================
 
 apiVersion: v1
 kind: ResourceQuota
 
 metadata:
-  name: prod-quota                 # Quota name; multiple quotas can exist per namespace
-  namespace: caloriechecker-prod   # Must match the namespace above
+  name: prod-quota
+  namespace: caloriechecker-prod
 
 spec:
   hard:
-    # ── CPU Quota ─────────────────────────────────────────────
-    # requests.cpu: the SUM of all containers' cpu.requests
-    # cannot exceed 4 cores across the whole namespace.
-    # The scheduler uses requests to decide WHERE to place pods.
     requests.cpu: "4"
-
-    # limits.cpu: the SUM of all containers' cpu.limits
-    # cannot exceed 8 cores. Limits are the burst ceiling —
-    # setting it to 2× requests allows bursting when the node
-    # has spare capacity.
     limits.cpu: "8"
-
-    # ── Memory Quota ──────────────────────────────────────────
-    # requests.memory: guaranteed memory across all containers.
-    # 4Gi covers Django(512Mi) + Nginx(128Mi) + Postgres(512Mi)
-    # × 2 replicas with comfortable headroom.
     requests.memory: "4Gi"
-
-    # limits.memory: burst ceiling at 2× the request value.
-    # Memory limits are hard — exceeding them causes OOMKill.
     limits.memory: "8Gi"
-
-    # ── Object Count Quotas ───────────────────────────────────
-    # These prevent runaway automation from flooding the namespace
-    # with too many objects (e.g., a broken CronJob creating infinite Jobs).
-
     pods: "20"
-    # Maximum number of pods in this namespace (all states).
-    # Includes init containers but not completed Jobs.
-    # 20 pods is generous for: backend (2) + frontend (2) +
-    # postgres (1) + migration jobs + spare capacity.
-
     persistentvolumeclaims: "5"
-    # PVCs represent storage volumes. Each costs money on DigitalOcean.
-    # 5 is enough for: postgres data, postgres backup, media files, spare.
-
     services: "10"
-    # Services (ClusterIP, NodePort, LoadBalancer).
-    # 10 covers: backend, frontend, postgres, ingress + spare.
-
     secrets: "20"
-    # Secrets for: app credentials, TLS certificates, Docker pull creds.
-    # 20 gives room for rotation (old + new secret during rollover).
-
     configmaps: "10"
-    # ConfigMaps for: app config, nginx config, Prometheus scrape configs.
 
 ---
-# ============================================================
-# LimitRange — prod-limitrange
-# ============================================================
-# A LimitRange sets per-CONTAINER (or per-Pod) boundaries.
-# It works in tandem with ResourceQuota:
-#
-#   ResourceQuota = "total pie"  (namespace ceiling)
-#   LimitRange    = "slice size" (per-container defaults & bounds)
-#
-# Three problems LimitRange solves:
-#
-# 1. Auto-injection of defaults
-#    If a developer's container has NO resource requests/limits
-#    set, the LimitRange injects defaultRequest and default.
-#    This prevents unbounded containers from bypassing the quota
-#    (which requires ALL containers to have requests+limits).
-#
-# 2. Prevents resource hogging
-#    The `max` field prevents any single container from claiming
-#    more than 2 CPU / 2Gi memory. Without this, one container
-#    could claim the entire namespace ResourceQuota.
-#
-# 3. Prevents degenerate values
-#    The `min` field ensures containers don't set requests so
-#    small (e.g., cpu: 1m) that the scheduler can't make good
-#    placement decisions.
-# ============================================================
 
 apiVersion: v1
 kind: LimitRange
@@ -191,42 +47,20 @@ metadata:
 
 spec:
   limits:
-    # type: Container means these limits apply to each individual
-    # container, not to the pod as a whole.
-    # (type: Pod would set limits on the sum of all containers in a pod.)
     - type: Container
 
-      # ── Default Limit ─────────────────────────────────────────
-      # Injected when a container specifies NO limits.
-      # A container cannot use more than these values.
-      # Memory limits are enforced via Linux cgroups — exceeding
-      # the memory limit triggers OOMKill (the container is restarted).
       default:
-        cpu: "500m"      # 0.5 vCPU max burst per container
-        memory: "512Mi"  # 512 mebibytes max memory per container
+        cpu: "500m"
+        memory: "512Mi"
 
-      # ── Default Request ───────────────────────────────────────
-      # Injected when a container specifies NO requests.
-      # The scheduler uses requests to find a node with enough
-      # available capacity. If requests are too low, pods get
-      # scheduled onto overloaded nodes and performance suffers.
       defaultRequest:
-        cpu: "100m"      # 0.1 vCPU guaranteed per container
-        memory: "128Mi"  # 128 mebibytes guaranteed per container
+        cpu: "100m"
+        memory: "128Mi"
 
-      # ── Maximum Allowed ───────────────────────────────────────
-      # A developer CANNOT set a limit higher than this in their
-      # pod spec. If they try, the API server rejects the request.
-      # 2 vCPU and 2Gi is a reasonable ceiling — if a container
-      # needs more, it's probably a performance bug or a sign
-      # that it should be split into separate services.
       max:
-        cpu: "2"         # Hard cap: no container can exceed 2 vCPU
-        memory: "2Gi"    # Hard cap: no container can exceed 2 GiB RAM
+        cpu: "2"
+        memory: "2Gi"
 
-      # ── Minimum Required ──────────────────────────────────────
-      # A developer CANNOT set requests lower than this.
-      # Prevents misleading the scheduler with fake-tiny requests.
       min:
-        cpu: "50m"      # At least 0.05 vCPU requested
-        memory: "64Mi"  # At least 64 MiB requested
+        cpu: "50m"
+        memory: "64Mi"
